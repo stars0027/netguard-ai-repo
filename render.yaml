@@ -1,0 +1,19 @@
+# Render Blueprint: New -> Blueprint -> pick this repo. Review the plan before applying.
+services:
+  - type: web
+    name: netguard-ai
+    runtime: docker
+    plan: starter            # a persistent disk needs a paid plan; check Render's current pricing
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: netguard-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"

@@ -1,0 +1,14 @@
+{
+  "name": "netguard-ai",
+  "version": "2.0.0",
+  "description": "NetGuard AI - multi-user network defense platform: adaptive anomaly detection, auto-blocking and live monitoring. Zero npm dependencies.",
+  "main": "server/index.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node test/e2e.js"
+  },
+  "license": "ISC",
+  "dependencies": {}
+}
