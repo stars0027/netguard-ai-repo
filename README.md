@@ -1,4 +1,4 @@
-# NetGuard AI
+n# NetGuard AI
 
 A multi-user network defense platform. Users sign up, install a small **agent** on the machines they
 want to protect, and NetGuard **learns normal traffic, detects attacks, blocks the attacker in the OS
