@@ -100,3 +100,11 @@ test/     e2e.js                          (37 checks against a live server)
 - Alarm sound and browser notification for serious alerts (toggle in the header)
 - Alerts export as CSV (`/api/alerts.csv`)
 - New lemon / charcoal / lavender / amber look
+
+## Real AI for the Copilot (optional, free tier available)
+Set one environment variable on the server and the Copilot becomes a real AI that you can type to or talk to, in English and Tamil:
+- `GEMINI_API_KEY` (free key from https://aistudio.google.com/apikey), optional `GEMINI_MODEL`
+- or `ANTHROPIC_API_KEY`, optional `ANTHROPIC_MODEL`
+- `AI_DAILY_LIMIT` caps questions per user per day (default 150).
+Only a summary of your alerts, devices and attacker IPs is sent to the AI. Passwords, emails and API keys are never sent.
+Without a key the built-in rule-based assistant is used.

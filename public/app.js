@@ -576,17 +576,34 @@
 
   // ------------------------------------------------------------------ copilot (rule-based assistant, answers from your own data)
   function copilotView() {
-    const getLang = () => { try { return localStorage.getItem('ng_lang') || 'both'; } catch { return 'auto'; } };
+    const getLang = () => { try { return localStorage.getItem('ng_lang') || 'both'; } catch { return 'both'; } };
     const UI = {
-      en: { hello: 'Hi, I am NetGuard Copilot. I read your alerts, blocks and devices and explain them in plain words. I can also block an IP or turn on lockdown when you ask. I do not use any outside AI service, so your data stays on your server. Ask me in English or Tamil.', ph: 'Ask: "Am I safe?", "What is a port scan?", "block 203.0.113.5"…', ask: 'Ask', you: 'You', bot: 'NetGuard Copilot', label: 'Your question', chips: ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'What is a port scan?', 'How do I add a device?', 'lockdown on'], mic: 'Speak', read: 'Read answers aloud' },
-      ta: { hello: 'வணக்கம்! நான் NetGuard Copilot. உங்கள் அலெர்ட்கள், தடைகள், சாதனங்களை எளிய தமிழில் விளக்குவேன். நீங்கள் கேட்டால் ஒரு IP-ஐத் தடுக்கவும், lockdown-ஐ இயக்கவும் செய்வேன். வெளி AI சேவை எதுவும் பயன்படுத்தவில்லை, உங்கள் தரவு உங்கள் சர்வரிலேயே இருக்கும். தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.', ph: 'கேளுங்கள்: "நான் பாதுகாப்பாக இருக்கிறேனா?", "போர்ட் ஸ்கேன் என்றால் என்ன?"…', ask: 'கேள்', you: 'நீங்கள்', bot: 'NetGuard Copilot', label: 'உங்கள் கேள்வி', chips: ['நான் பாதுகாப்பாக இருக்கிறேனா?', 'இன்று என்ன நடந்தது?', 'என்னை யார் தாக்குகிறார்கள்?', 'நான் என்ன செய்ய வேண்டும்?', 'போர்ட் ஸ்கேன் என்றால் என்ன?', 'சாதனத்தை எப்படிச் சேர்ப்பது?', 'lockdown on'], mic: 'பேசு', read: 'பதில்களை உரக்கப் படி' },
+      en: { hello: 'Hi, I am NetGuard Copilot. Ask me anything about your security, by typing or by pressing Talk. I can explain attacks, check an IP, and block it or turn on lockdown when you confirm.', ph: 'Ask anything: "Is my network safe?", "What is a port scan?", "block 203.0.113.5"…', ask: 'Ask', you: 'You', bot: 'NetGuard Copilot', label: 'Your question', chips: ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'What is a port scan?', 'How do I add a device?', 'lockdown on'], read: 'Read answers aloud', talk: 'Talk', stop: 'Stop talking' },
+      ta: { hello: 'வணக்கம்! நான் NetGuard Copilot. உங்கள் பாதுகாப்பு பற்றி எதையும் கேளுங்கள், தட்டச்சு செய்தோ "பேசு" பொத்தானை அழுத்தியோ. தாக்குதல்களை விளக்குவேன், IP-ஐச் சரிபார்ப்பேன், நீங்கள் உறுதிப்படுத்தினால் தடுக்கவோ lockdown இயக்கவோ செய்வேன்.', ph: 'எதையும் கேளுங்கள்: "என் நெட்வொர்க் பாதுகாப்பாக உள்ளதா?", "போர்ட் ஸ்கேன் என்றால் என்ன?"…', ask: 'கேள்', you: 'நீங்கள்', bot: 'NetGuard Copilot', label: 'உங்கள் கேள்வி', chips: ['நான் பாதுகாப்பாக இருக்கிறேனா?', 'இன்று என்ன நடந்தது?', 'என்னை யார் தாக்குகிறார்கள்?', 'நான் என்ன செய்ய வேண்டும்?', 'போர்ட் ஸ்கேன் என்றால் என்ன?', 'சாதனத்தை எப்படிச் சேர்ப்பது?', 'lockdown on'], read: 'பதில்களை உரக்கப் படி', talk: 'பேசு', stop: 'பேசுவதை நிறுத்து' },
     };
     const ui = () => UI[getLang() === 'ta' ? 'ta' : 'en'];
     const log = el('div', { class: 'chat', 'aria-live': 'polite' });
-    const input = el('input', { type: 'text', maxlength: 300, 'aria-label': 'Ask Copilot' });
+    const input = el('input', { type: 'text', maxlength: 400, 'aria-label': 'Ask Copilot' });
     const chipsBox = el('div', { class: 'chips' }), askBtn = el('button', { class: 'btn primary', type: 'submit' }), labelTxt = el('span', {});
-    let readAloud = true;
-    const speak = (text, lang) => { try { if (!readAloud || !('speechSynthesis' in window)) return; speechSynthesis.cancel(); const parts = lang === 'both' ? text.split('\n\n') : [text]; parts.forEach((t, i) => { const l = lang === 'both' ? (i === 0 ? 'en' : 'ta') : lang; const u = new SpeechSynthesisUtterance(t); u.lang = l === 'ta' ? 'ta-IN' : 'en-IN'; const v = speechSynthesis.getVoices().find((x) => x.lang && x.lang.toLowerCase().startsWith(l)); if (v) u.voice = v; speechSynthesis.speak(u); }); } catch { /* ignore */ } };
+    const badge = el('span', { class: 'aibadge' }, '…');
+    const history = []; let readAloud = true, convo = false, rec = null, busy = false;
+    api('GET', '/api/copilot/status').then((r) => { badge.textContent = r.ai ? 'AI: ' + (r.ai === 'gemini' ? 'Gemini' : 'Claude') : 'Basic mode'; badge.dataset.ai = r.ai ? '1' : '0'; badge.title = r.ai ? 'Real AI is on' : 'Add GEMINI_API_KEY on the server to turn on the full AI'; }).catch(() => {});
+    // speak() resolves when the voice finishes, so the hands-free loop knows when to listen again
+    const speak = (text, lang) => new Promise((resolve) => {
+      try {
+        if (!readAloud || !('speechSynthesis' in window)) return resolve();
+        speechSynthesis.cancel();
+        const parts = lang === 'both' ? text.split('\n\n') : [text], voices = speechSynthesis.getVoices();
+        parts.forEach((t, i) => {
+          const l = lang === 'both' ? (i === 0 ? 'en' : 'ta') : (lang === 'ta' || /[஀-௿]/.test(t) ? 'ta' : 'en');
+          const u = new SpeechSynthesisUtterance(t); u.lang = l === 'ta' ? 'ta-IN' : 'en-IN';
+          const v = voices.find((x) => x.lang && x.lang.toLowerCase().startsWith(l)); if (v) u.voice = v;
+          if (i === parts.length - 1) { u.onend = resolve; u.onerror = resolve; }
+          speechSynthesis.speak(u);
+        });
+        setTimeout(resolve, 45000);
+      } catch { resolve(); }
+    });
     const runAction = async (ac, btn) => {
       btn.disabled = true;
       try {
@@ -596,44 +613,71 @@
         btn.textContent = '✓ ' + btn.textContent; loadInsights();
       } catch (e) { toast(e.message, true); btn.disabled = false; }
     };
-    const add = (who, text, extra = {}) => {
-      const u = ui(), bubble = el('div', { class: 'msg ' + who }, el('span', { class: 'who' }, who === 'me' ? u.you : u.bot), el('p', {}, ''));
+    const add = (who, text, extra = {}) => new Promise((done) => {
+      const u = ui(), bubble = el('div', { class: 'msg ' + who }, el('span', { class: 'who' }, who === 'me' ? u.you : u.bot + (extra.ai ? ' · AI' : '')), el('p', {}, ''));
       log.append(bubble); log.scrollTop = log.scrollHeight;
       const p = bubble.querySelector('p');
-      if (who === 'me') { p.textContent = text; return; }
-      let i = 0; const step = Math.max(1, Math.round(text.length / 70));
+      if (who === 'me') { p.textContent = text; return done(); }
+      let i = 0; const step = Math.max(1, Math.round(text.length / 60));
       const iv = setInterval(() => {
         i += step; p.textContent = text.slice(0, i); log.scrollTop = log.scrollHeight;
         if (i >= text.length) {
-          clearInterval(iv); speak(text, extra.lang);
+          clearInterval(iv);
           (extra.actions || []).forEach((ac) => { const b = el('button', { class: 'btn sm ' + (ac.kind === 'block' || (ac.kind === 'lockdown' && ac.on) ? 'danger' : ''), type: 'button', style: 'margin:8px 8px 0 0' }, ac.label); b.onclick = () => runAction(ac, b); bubble.append(b); });
           (extra.links || []).forEach((l) => bubble.append(el('a', { class: 'btn sm', href: l.href, style: 'text-decoration:none;display:inline-flex;margin:8px 8px 0 0' }, l.label)));
           log.scrollTop = log.scrollHeight;
+          speak(text, extra.lang).then(done);
         }
       }, 18);
-    };
+    });
     async function ask(q) {
-      q = q.trim(); if (!q) return; add('me', q); input.value = '';
-      try { const r = await api('POST', '/api/copilot', { question: q, lang: getLang() }); add('bot', r.answer, r); } catch (e) { add('bot', 'Sorry: ' + e.message); }
+      q = q.trim(); if (!q || busy) return; busy = true; add('me', q); input.value = '';
+      const thinking = el('div', { class: 'msg bot thinking' }, el('span', { class: 'dots' }, '● ● ●')); log.append(thinking); log.scrollTop = log.scrollHeight;
+      try {
+        const r = await api('POST', '/api/copilot', { question: q, lang: getLang(), history: history.slice(-6) });
+        thinking.remove(); history.push({ role: 'user', text: q }, { role: 'bot', text: r.answer });
+        if (r.ai) { badge.textContent = 'AI: ' + (r.ai === 'gemini' ? 'Gemini' : 'Claude'); badge.dataset.ai = '1'; }
+        await add('bot', r.answer, r);
+      } catch (e) { thinking.remove(); await add('bot', 'Sorry: ' + e.message); }
+      busy = false;
+      if (convo) listen();
     }
     function paintUi(first) {
-      const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label;
+      const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label; talkBtn.textContent = convo ? '⏹ ' + u.stop : '🎙 ' + u.talk;
       chipsBox.replaceChildren(...(getLang() === 'both' ? [...UI.en.chips, ...UI.ta.chips.slice(0, 6)] : u.chips).map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
       if (first) add('bot', getLang() === 'both' ? UI.en.hello + '\n\n' + UI.ta.hello : u.hello, { lang: getLang() });
     }
+    // hands-free voice conversation: listen -> think -> speak -> listen again
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    function listen() {
+      if (!SR || !convo) return;
+      try {
+        rec = new SR(); const l = getLang();
+        rec.lang = l === 'ta' ? 'ta-IN' : l === 'en' ? 'en-IN' : 'ta-IN'; // 'ta-IN' recognises Tamil and usually English words too
+        rec.interimResults = false; rec.maxAlternatives = 1;
+        talkBtn.classList.add('live');
+        rec.onresult = (e) => { const t = e.results[0][0].transcript; input.value = t; ask(t); };
+        rec.onerror = (e) => { talkBtn.classList.remove('live'); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { convo = false; paintUi(false); toast('Allow the microphone to talk to Copilot', true); } else if (convo && !busy) setTimeout(listen, 800); };
+        rec.onend = () => { talkBtn.classList.remove('live'); if (convo && !busy && !speechSynthesis.speaking) setTimeout(listen, 500); };
+        rec.start();
+      } catch { convo = false; paintUi(false); }
+    }
+    const talkBtn = el('button', { class: 'btn talk', type: 'button', 'aria-label': 'Talk to Copilot' });
+    talkBtn.onclick = () => {
+      if (!SR) { toast('Voice input needs Chrome or Edge', true); return; }
+      convo = !convo; if (!convo) { try { rec && rec.abort(); } catch { /* ignore */ } try { speechSynthesis.cancel(); } catch { /* ignore */ } talkBtn.classList.remove('live'); } else { readAloud = true; readChk.checked = true; listen(); }
+      paintUi(false);
+    };
     const langSel = el('select', { 'aria-label': 'Language', onchange: (e) => { try { localStorage.setItem('ng_lang', e.target.value); } catch { /* ignore */ } paintUi(false); } },
       el('option', { value: 'both' }, 'English + தமிழ்'), el('option', { value: 'auto' }, 'Auto'), el('option', { value: 'en' }, 'English'), el('option', { value: 'ta' }, 'தமிழ்'));
     langSel.value = getLang();
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const mic = SR ? el('button', { class: 'btn', type: 'button', 'aria-label': 'Speak your question' }, '🎤') : null;
-    if (mic) mic.onclick = () => { try { const r = new SR(); r.lang = getLang() === 'ta' ? 'ta-IN' : getLang() === 'en' ? 'en-IN' : navigator.language || 'en-IN'; r.interimResults = false; mic.disabled = true; r.onresult = (e) => { ask(e.results[0][0].transcript); }; r.onend = () => { mic.disabled = false; }; r.onerror = () => { mic.disabled = false; toast('Could not hear you', true); }; r.start(); } catch { mic.disabled = false; } };
     const readChk = el('input', { type: 'checkbox', checked: true, onchange: (e) => { readAloud = e.target.checked; if (!readAloud && 'speechSynthesis' in window) speechSynthesis.cancel(); } });
-    current = { cleanup: () => { try { speechSynthesis.cancel(); } catch { /* ignore */ } } };
+    current = { cleanup: () => { convo = false; try { rec && rec.abort(); } catch { /* ignore */ } try { speechSynthesis.cancel(); } catch { /* ignore */ } } };
     paintUi(true);
     return el('section', { class: 'view grid' }, el('div', { class: 'panel pad copilot' },
-      el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, el('label', { class: 'check', style: 'margin-right:10px' }, readChk, ui().read), el('span', { style: 'margin-right:6px' }, 'Language'), langSel)),
+      el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, badge, el('label', { class: 'check', style: 'margin:0 10px' }, readChk, ui().read), el('span', { style: 'margin-right:6px' }, 'Language'), langSel)),
       log, chipsBox,
-      el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); ask(input.value); } }, el('label', {}, labelTxt, input), mic, askBtn)));
+      el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); ask(input.value); } }, el('label', {}, labelTxt, input), talkBtn, askBtn)));
   }
 
   // ------------------------------------------------------------------ tools: IP inspector + threat hunt
