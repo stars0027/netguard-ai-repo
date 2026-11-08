@@ -56,7 +56,7 @@
   // ------------------------------------------------------------------ state
   const S = {
     me: null, devices: [], alerts: [], logs: [], stats: {}, sel: null, series: [], live: {}, banner: null, bannerTimer: null,
-    openAlert: null, stream: null, linked: false,
+    openAlert: null, stream: null, linked: false, ins: null,
   };
   let current = { refresh: null };
 
@@ -87,8 +87,9 @@
     es.addEventListener('alert', (e) => {
       const a = JSON.parse(e.data);
       S.alerts.unshift(a);
-      refreshStats();
+      refreshStats(); loadInsights();
       if (['critical', 'high'].includes(a.severity)) {
+        alarmSound(a);
         const blocked = /^Blocked/.test(a.action || '');
         S.banner = {
           title: a.type === 'physical_anomaly' ? 'Emergency power shutdown' : blocked ? 'Attack blocked' : 'Attack detected',
@@ -102,12 +103,34 @@
       updateNavBadge();
     });
     for (const ev of ['alert_update', 'alert_status', 'block', 'unblock', 'device']) {
-      es.addEventListener(ev, () => { if (ev.startsWith('alert')) loadAlerts().then(() => { current.refresh && current.refresh(); updateNavBadge(); }); else { if (ev === 'device') loadDevices(); refreshStats(); current.refresh && current.refresh(); } });
+      es.addEventListener(ev, () => { if (ev.startsWith('alert')) loadAlerts().then(() => { current.refresh && current.refresh(); updateNavBadge(); }); else { if (ev === 'device') loadDevices(); refreshStats(); loadInsights(); current.refresh && current.refresh(); } });
     }
   }
   async function refreshStats() { try { S.stats = await api('GET', '/api/stats'); updateNavBadge(); if (current.tick) current.tick(); } catch { /* ignore */ } }
   async function loadDevices() { S.devices = (await api('GET', '/api/devices')).filter((d) => !d.virtual || demoOn()); if (!S.sel || !S.devices.find((d) => d.id === S.sel)) S.sel = S.devices[0] && S.devices[0].id; }
   async function loadAlerts() { S.alerts = await api('GET', '/api/alerts?limit=200'); }
+  async function loadInsights() { try { S.ins = await api('GET', '/api/insights'); if (current.insights) current.insights(); } catch { /* ignore */ } }
+  const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
+  const typeLabel = (t) => TYPE_LABEL[t] || String(t).replace(/_/g, ' ');
+  // sound + browser notification when something serious happens (opt-in, remembered per browser)
+  const soundOn = () => { try { return localStorage.getItem('ng_sound') === '1'; } catch { return false; } };
+  let audioCtx;
+  function alarmSound(a) {
+    if (!soundOn()) return;
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const t0 = audioCtx.currentTime, tones = a.severity === 'critical' ? [880, 660, 880, 660] : [740, 740];
+      tones.forEach((f, i) => { const o = audioCtx.createOscillator(), g = audioCtx.createGain(); o.type = 'square'; o.frequency.value = f; g.gain.setValueAtTime(0.0001, t0 + i * 0.18); g.gain.exponentialRampToValueAtTime(0.12, t0 + i * 0.18 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.18 + 0.16); o.connect(g); g.connect(audioCtx.destination); o.start(t0 + i * 0.18); o.stop(t0 + i * 0.18 + 0.17); });
+    } catch { /* audio not available */ }
+    try { if (a.title && 'speechSynthesis' in window) { const u = new SpeechSynthesisUtterance((a.severity === 'critical' ? 'Critical alert. ' : 'Warning. ') + a.title.replace(/[^\w .,:-]/g, ' ').slice(0, 120)); u.rate = 1.05; u.volume = 0.8; speechSynthesis.speak(u); } } catch { /* ignore */ }
+    try { if (document.hidden && 'Notification' in window && Notification.permission === 'granted') new Notification('NetGuard AI: ' + a.title, { body: a.action || a.severity }); } catch { /* ignore */ }
+  }
+  function toggleSound(btn) {
+    const on = !soundOn();
+    try { localStorage.setItem('ng_sound', on ? '1' : '0'); } catch { /* ignore */ }
+    if (on) { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch { /* ignore */ } alarmSound({ severity: 'high' }); }
+    btn.textContent = on ? 'Sound on' : 'Sound off'; btn.setAttribute('aria-pressed', String(on));
+  }
   function updateNavBadge() { const b = document.getElementById('navBadge'); if (b) { const n = S.alerts.filter((a) => a.status === 'open').length; b.textContent = n > 99 ? '99+' : n; b.hidden = !n; } }
   function updateLink() {
     const l = document.getElementById('linkLed'), t = document.getElementById('linkText');
@@ -148,6 +171,7 @@
       el('div', { class: 'auth' },
         el('div', {},
           el('div', { class: 'brand' }, el('span', { class: 'mark' }, svg(SHIELD)), el('div', {}, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense'))),
+          el('div', { class: 'scene', 'aria-hidden': 'true' }, el('div', { class: 'shield3d' }, [0, 1, 2, 3, 4, 5].map((i) => el('div', { class: 'layer l' + i })))),
           el('h2', { class: 'big-h', style: 'margin-top:28px;text-transform:none;letter-spacing:.02em' }, 'Detect attacks on your network and block them automatically.'),
           el('ul', {},
             el('li', {}, 'Install the agent on any server, PC or gateway'),
@@ -159,7 +183,7 @@
 
   // ------------------------------------------------------------------ shell
   const demoOn = () => { try { return localStorage.getItem('ng_demo') === '1'; } catch { return false; } };
-  const navItems = () => [['dashboard', 'Dashboard'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], demoOn() ? ['simulator', 'Demo'] : null, ['settings', 'Settings']].filter(Boolean);
+  const navItems = () => [['dashboard', 'Dashboard'], ['copilot', 'Copilot'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], ['tools', 'Tools'], ['warroom', 'War Room'], ['report', 'Report'], demoOn() ? ['simulator', 'Demo'] : null, ['settings', 'Settings']].filter(Boolean);
   function shell(view, active) {
     const badge = el('span', { class: 'badge', id: 'navBadge', hidden: true });
     return el('div', { class: 'wrap' },
@@ -167,6 +191,7 @@
         el('div', { class: 'brand' }, el('span', { class: 'mark' }, svg(SHIELD)), el('div', {}, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense'))),
         el('nav', { class: 'nav' },
           el('div', { class: 'tabs' }, navItems().map(([k, label]) => el('a', { href: '#/' + k, 'aria-current': k === active ? 'page' : null }, label, k === 'alerts' ? badge : null))),
+          el('button', { class: 'btn sm', type: 'button', 'aria-pressed': String(soundOn()), title: 'Play an alarm sound and show a notification for serious alerts', onclick: (e) => toggleSound(e.currentTarget) }, soundOn() ? 'Sound on' : 'Sound off'),
           el('span', { class: 'link' }, el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
           el('button', { class: 'btn sm', type: 'button', title: S.me.email, onclick: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } }, 'Sign out'))),
       view);
@@ -184,21 +209,21 @@
     c.font = '11px IBM Plex Mono, monospace'; c.textBaseline = 'middle';
     for (let i = 0; i <= 4; i++) {
       const v = (max / 4) * i, yy = y(v);
-      c.strokeStyle = 'rgba(138,158,173,.1)'; c.beginPath(); c.moveTo(L, yy); c.lineTo(w - R, yy); c.stroke();
-      c.fillStyle = '#8a9ead'; c.textAlign = 'right'; c.fillText(Math.round(v).toLocaleString(), L - 6, yy);
+      c.strokeStyle = 'rgba(255,255,255,.07)'; c.beginPath(); c.moveTo(L, yy); c.lineTo(w - R, yy); c.stroke();
+      c.fillStyle = '#a8a8a0'; c.textAlign = 'right'; c.fillText(Math.round(v).toLocaleString(), L - 6, yy);
     }
     if (!pts.length) { c.fillStyle = '#8a9ead'; c.textAlign = 'center'; c.fillText('Waiting for telemetry…', w / 2, h / 2); return; }
     const t1 = pts[pts.length - 1].ts, span = 120000, t0 = t1 - span, x = (t) => L + ((t - t0) / span) * pw;
     c.textAlign = 'center'; c.fillStyle = '#8a9ead';
     for (let i = 0; i <= 4; i++) { const t = t0 + (span / 4) * i; c.fillText(fmtTime(t), Math.min(w - 24, Math.max(L + 22, x(t))), h - 8); }
-    if (thr) { c.setLineDash([6, 6]); c.strokeStyle = 'rgba(245,181,61,.7)'; c.beginPath(); c.moveTo(L, y(thr)); c.lineTo(w - R, y(thr)); c.stroke(); c.setLineDash([]); }
-    const col = hot ? '#ff5557' : '#2dd4c0';
+    if (thr) { c.setLineDash([6, 6]); c.strokeStyle = 'rgba(200,121,44,.95)'; c.beginPath(); c.moveTo(L, y(thr)); c.lineTo(w - R, y(thr)); c.stroke(); c.setLineDash([]); }
+    const col = hot ? '#ff5557' : '#FFF21A';
     const vis = pts.filter((p) => p.ts >= t0);
     if (!vis.length) return;
     c.beginPath(); vis.forEach((p, i) => (i ? c.lineTo(x(p.ts), y(p.pps)) : c.moveTo(x(p.ts), y(p.pps))));
     c.lineWidth = 2.5; c.strokeStyle = col; c.stroke();
     c.lineTo(x(vis[vis.length - 1].ts), y(0)); c.lineTo(x(vis[0].ts), y(0)); c.closePath();
-    c.fillStyle = hot ? 'rgba(255,85,87,.2)' : 'rgba(45,212,192,.14)'; c.fill();
+    const gr = c.createLinearGradient(0, T, 0, T + ph); gr.addColorStop(0, hot ? 'rgba(255,85,87,.35)' : 'rgba(255,242,26,.28)'); gr.addColorStop(1, 'rgba(255,242,26,0)'); c.fillStyle = gr; c.fill();
   }
 
   // ------------------------------------------------------------------ dashboard
@@ -253,9 +278,95 @@
     const showEmpty = () => { empty.hidden = S.devices.length > 0; kpis.hidden = chartRow.hidden = S.devices.length === 0; };
     const prevTick = tick; current.tick = () => { showEmpty(); prevTick(); };
     const chartRow = el('div', { class: 'split' }, chartPanel, el('section', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Live logs'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'streaming')), logs));
+    // ---- next-level insights: security score, 24h timeline, attack types, top attackers
+    const SVGNS = 'http://www.w3.org/2000/svg', R = 52, CIRC = 2 * Math.PI * R;
+    const ringArc = document.createElementNS(SVGNS, 'circle');
+    for (const [k, v] of Object.entries({ cx: 70, cy: 70, r: R, fill: 'none', 'stroke-width': 12, 'stroke-linecap': 'round', transform: 'rotate(-90 70 70)', 'stroke-dasharray': `0 ${CIRC}`, class: 'ring-arc' })) ringArc.setAttribute(k, v);
+    const ringBg = document.createElementNS(SVGNS, 'circle');
+    for (const [k, v] of Object.entries({ cx: 70, cy: 70, r: R, fill: 'none', 'stroke-width': 12, class: 'ring-bg' })) ringBg.setAttribute(k, v);
+    const ring = document.createElementNS(SVGNS, 'svg'); ring.setAttribute('viewBox', '0 0 140 140'); ring.setAttribute('class', 'ring'); ring.setAttribute('role', 'img'); ring.setAttribute('aria-label', 'Security score'); ring.append(ringBg, ringArc);
+    const scoreNum = el('div', { class: 'score-num' }, '—'), scoreLbl = el('div', { class: 'score-lbl' }, 'Security score');
+    const factorsBox = el('ul', { class: 'factors' });
+    const tl = el('canvas', { role: 'img', 'aria-label': 'Alerts per hour over the last 24 hours' });
+    const typesBox = el('div', { class: 'bars' }), atkBox = el('div', { class: 'atk' });
+    function paintTimeline() {
+      const c = tl, dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight; if (!w || !h) return;
+      if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+      const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+      const data = (S.ins && S.ins.timeline) || [], max = Math.max(3, ...data.map((b) => b.critical + b.high + b.other)), bw = (w - 8) / 24, base = h - 20;
+      g.font = '10px IBM Plex Mono, monospace'; g.fillStyle = '#a8a8a0'; g.textAlign = 'center';
+      data.forEach((b, i) => {
+        const x = 4 + i * bw + bw * 0.14, ww = bw * 0.72; let y = base;
+        for (const [n, col] of [[b.other, '#A66BFF'], [b.high, '#C8792C'], [b.critical, '#ff5557']]) { const hh = (n / max) * (base - 6); if (hh) { g.fillStyle = col; g.fillRect(x, y - hh, ww, hh); y -= hh; } }
+        if (!(b.critical + b.high + b.other)) { g.fillStyle = 'rgba(255,255,255,.08)'; g.fillRect(x, base - 2, ww, 2); }
+        if (i % 6 === 0 || i === 23) { g.fillStyle = '#a8a8a0'; g.fillText(new Date(b.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }), Math.min(w - 16, Math.max(16, x + ww / 2)), h - 5); }
+      });
+    }
+    function paintInsights() {
+      const I = S.ins; if (!I) return;
+      const sc = I.score;
+      scoreNum.textContent = sc == null ? '—' : String(sc);
+      const tone = sc == null ? 'idle' : sc >= 85 ? 'good' : sc >= 60 ? 'mid' : 'bad';
+      ring.dataset.tone = tone; scoreNum.dataset.tone = tone;
+      ringArc.setAttribute('stroke-dasharray', `${((sc || 0) / 100) * CIRC} ${CIRC}`);
+      scoreLbl.textContent = sc == null ? 'Add a device to get a score' : sc >= 85 ? 'Well protected' : sc >= 60 ? 'Needs attention' : 'At risk';
+      factorsBox.replaceChildren(...(I.factors.length ? I.factors.map((f) => el('li', {}, el('strong', {}, '−' + f.points + ' '), f.label, el('span', { class: 'muted' }, ' — ' + f.fix))) : [el('li', { class: 'muted' }, sc == null ? 'Protect a device to see how safe you are.' : 'Nothing to fix. Everything looks healthy.')]));
+      const mx = Math.max(1, ...I.by_type.map((t) => t.c));
+      typesBox.replaceChildren(...(I.by_type.length ? I.by_type.map((t) => el('div', { class: 'bar' }, el('span', { class: 'bl' }, typeLabel(t.type)), el('span', { class: 'bt' }, el('i', { style: `width:${Math.max(4, (t.c / mx) * 100)}%` })), el('span', { class: 'bn' }, t.c))) : [el('p', { class: 'empty' }, 'No attacks in the last 7 days.')]));
+      atkBox.replaceChildren(...(I.attackers.length ? I.attackers.map((a) => el('div', { class: 'atk-row' },
+        el('div', {}, el('div', { class: 'mono ip' }, a.ip), el('div', { class: 'muted small' }, a.types.map(typeLabel).join(', ') + ' · ' + a.alerts + ' alert' + (a.alerts === 1 ? '' : 's') + ' · ' + ago(a.last))),
+        a.blocked ? el('span', { class: 'pill ok' }, 'Blocked') : el('button', { class: 'btn sm danger', onclick: async () => { try { await api('POST', '/api/blocks', { ip: a.ip, reason: 'Blocked from top attackers' }); toast('Blocked ' + a.ip); loadInsights(); } catch (e) { toast(e.message, true); } } }, 'Block'))) : [el('p', { class: 'empty' }, 'No attackers seen yet. That is good news.')]));
+      paintTimeline();
+    }
+    current.insights = paintInsights;
+    const prevCl = current.cleanup; current.cleanup = () => { prevCl(); window.removeEventListener('resize', paintTimeline); }; window.addEventListener('resize', paintTimeline);
+    loadInsights();
+    // ---- live threat radar: every attacker seen this week is a blip; blocked ones are neutralised
+    const radar = el('canvas', { role: 'img', 'aria-label': 'Radar showing attackers around your network' });
+    let alive = true, t0 = performance.now();
+    const hashN = (str, salt) => { let h = 2166136261 ^ salt; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 10000) / 10000; };
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    function drawRadar(now) {
+      if (!alive) return;
+      const dpr = window.devicePixelRatio || 1, w = radar.clientWidth, h = radar.clientHeight;
+      if (w && h) {
+        if (radar.width !== w * dpr || radar.height !== h * dpr) { radar.width = w * dpr; radar.height = h * dpr; }
+        const g = radar.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+        const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 8, ang = reduce ? 0 : ((now - t0) / 4200) * Math.PI * 2;
+        g.strokeStyle = 'rgba(166,107,255,.35)'; g.lineWidth = 1;
+        for (let i = 1; i <= 4; i++) { g.beginPath(); g.arc(cx, cy, (R / 4) * i, 0, 7); g.stroke(); }
+        g.beginPath(); g.moveTo(cx - R, cy); g.lineTo(cx + R, cy); g.moveTo(cx, cy - R); g.lineTo(cx, cy + R); g.stroke();
+        if (!reduce) { const gr = g.createConicGradient ? g.createConicGradient(ang - 1.1, cx, cy) : null; if (gr) { gr.addColorStop(0, 'rgba(255,242,26,0)'); gr.addColorStop(0.17, 'rgba(255,242,26,.38)'); gr.addColorStop(0.1750, 'rgba(255,242,26,0)'); g.fillStyle = gr; g.beginPath(); g.arc(cx, cy, R, 0, 7); g.fill(); } g.strokeStyle = 'rgba(255,242,26,.9)'; g.lineWidth = 2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(ang) * R, cy + Math.sin(ang) * R); g.stroke(); }
+        g.fillStyle = '#FFF21A'; g.beginPath(); g.arc(cx, cy, 6, 0, 7); g.fill(); g.strokeStyle = 'rgba(255,242,26,.5)'; g.lineWidth = 2; g.beginPath(); g.arc(cx, cy, 10 + (reduce ? 0 : (Math.sin(now / 400) + 1) * 3), 0, 7); g.stroke();
+        const A = (S.ins && S.ins.attackers) || [];
+        for (const a of A) {
+          const th = hashN(a.ip, 1) * Math.PI * 2, rr = (0.3 + hashN(a.ip, 2) * 0.62) * R, x = cx + Math.cos(th) * rr, y = cy + Math.sin(th) * rr;
+          const lit = reduce ? 1 : Math.max(0.35, 1 - ((((ang - th) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2));
+          if (a.blocked) { g.strokeStyle = '#FFF21A'; g.lineWidth = 2; g.beginPath(); g.moveTo(x - 6, y - 6); g.lineTo(x + 6, y + 6); g.moveTo(x + 6, y - 6); g.lineTo(x - 6, y + 6); g.stroke(); g.fillStyle = 'rgba(255,242,26,.85)'; g.font = '10px IBM Plex Mono, monospace'; g.textAlign = 'center'; g.fillText(a.ip, x, y + 20); }
+          else { g.fillStyle = `rgba(255,85,87,${lit})`; g.beginPath(); g.arc(x, y, 6 + (reduce ? 0 : Math.sin(now / 200) * 1.5), 0, 7); g.fill(); g.fillStyle = '#ffd0d0'; g.font = '10px IBM Plex Mono, monospace'; g.textAlign = 'center'; g.fillText(a.ip, x, y + 20); }
+        }
+      }
+      requestAnimationFrame(drawRadar);
+    }
+    requestAnimationFrame(drawRadar);
+    const prevCl2 = current.cleanup; current.cleanup = () => { alive = false; prevCl2(); };
+    const lockBtn = el('button', { class: 'btn lock', type: 'button', 'aria-pressed': 'false' }, 'Lockdown: …');
+    const paintLock = async () => { const on = await getLockdown(); lockBtn.setAttribute('aria-pressed', String(on)); lockBtn.textContent = on ? 'Lockdown: ON' : 'Lockdown: OFF'; };
+    lockBtn.onclick = async () => { lockBtn.disabled = true; try { await setLockdown(lockBtn.getAttribute('aria-pressed') !== 'true'); } catch (e) { toast(e.message, true); } lockBtn.disabled = false; paintLock(); };
+    paintLock();
+    const radarRow = el('section', { class: 'panel pad radar-panel' },
+      el('div', { class: 'head' }, el('h2', {}, 'Threat radar'), el('span', { class: 'meta' }, lockBtn)),
+      el('div', { class: 'radarbox' }, radar),
+      el('p', { class: 'foot', style: 'margin-top:8px' }, 'Red = active attacker · Lemon X = neutralised · Lockdown = max sensitivity + auto-block · Press Ctrl+K for commands'));
+    const insightsRow = el('div', { class: 'insights' },
+      el('section', { class: 'panel pad score' }, el('div', { class: 'head' }, el('h2', {}, 'Security score')),
+        el('div', { class: 'score-wrap' }, el('div', { class: 'ring-box' }, ring, el('div', { class: 'ring-in' }, scoreNum, scoreLbl)), factorsBox)),
+      el('section', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Last 24 hours'), el('span', { class: 'meta legend' }, el('i', { class: 'sw crit' }), 'critical', el('i', { class: 'sw amb' }), 'high', el('i', { class: 'sw lav' }), 'other')), el('div', { class: 'tlbox' }, tl),
+        el('div', { class: 'head', style: 'margin-top:14px' }, el('h2', {}, 'Attack types · 7 days')), typesBox),
+      el('section', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Top attackers'), el('span', { class: 'meta' }, '7 days')), atkBox));
     return el('section', { class: 'view grid' },
       empty, banner, kpis,
-      chartRow,
+      chartRow, radarRow, insightsRow,
       el('p', { class: 'foot' }, 'Dashed line = anomaly threshold learned from this device\'s own normal traffic'));
   }
 
@@ -313,7 +424,7 @@
     const act = async (fn) => { try { await fn(); await loadAlerts(); await refreshStats(); paint(); } catch (e) { toast(e.message, true); } };
     function paint() {
       const rows = S.alerts.filter((a) => filter === 'all' || a.status === filter);
-      if (!rows.length) { body.replaceChildren(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'No alerts. Try the Simulator to see one.'))); return; }
+      if (!rows.length) { body.replaceChildren(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'No alerts. That means nothing suspicious has been seen.'))); return; }
       body.replaceChildren(...rows.flatMap((a) => {
         const tr = el('tr', { style: 'cursor:pointer', onclick: (e) => { if (e.target.closest('button')) return; S.openAlert = S.openAlert === a.id ? null : a.id; paint(); } },
           el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, el('span', { class: 'sev ' + a.severity }, a.severity)),
@@ -331,7 +442,7 @@
     current = { refresh: paint, tick: null };
     loadAlerts().then(paint);
     return el('section', { class: 'view panel pad' },
-      el('div', { class: 'head' }, el('h2', {}, 'Alerts'), el('span', { class: 'meta' }, sel)),
+      el('div', { class: 'head' }, el('h2', {}, 'Alerts'), el('span', { class: 'meta' }, el('a', { class: 'btn sm', href: '/api/alerts.csv', download: 'netguard-alerts.csv', style: 'text-decoration:none;display:inline-flex;align-items:center' }, 'Export CSV'), sel)),
       el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['Time', 'Severity', 'What happened', 'Source', 'Device', 'Status', ''].map((h) => el('th', {}, h)))), body)));
   }
 
@@ -428,8 +539,244 @@
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Account · ' + S.me.email)), pwForm));
   }
 
+  // ------------------------------------------------------------------ lockdown mode + command palette
+  async function getLockdown() { try { const c = await api('GET', '/api/settings'); return !!c.auto_block && c.sensitivity === 'high'; } catch { return false; } }
+  async function setLockdown(on) {
+    const cur = await api('GET', '/api/settings');
+    if (on) { try { localStorage.setItem('ng_prev_sens', cur.sensitivity); } catch { /* ignore */ } await api('PUT', '/api/settings', { auto_block: true, sensitivity: 'high' }); toast('Lockdown ON: maximum sensitivity, automatic blocking'); }
+    else { let prev = 'medium'; try { prev = localStorage.getItem('ng_prev_sens') || 'medium'; } catch { /* ignore */ } await api('PUT', '/api/settings', { sensitivity: prev === 'high' ? 'medium' : prev }); toast('Lockdown off: sensitivity restored'); }
+    loadInsights();
+  }
+  const THEMES = { lemon: ['#FFF21A', 'rgba(255,242,26,.13)', '#171717'], lavender: ['#A66BFF', 'rgba(166,107,255,.18)', '#171717'], amber: ['#C8792C', 'rgba(200,121,44,.2)', '#171717'], ice: ['#5ee7ff', 'rgba(94,231,255,.14)', '#04141c'] };
+  function applyTheme(name) {
+    const t = THEMES[name] || THEMES.lemon, r = document.documentElement.style;
+    r.setProperty('--accent', t[0]); r.setProperty('--accent-fill', t[1]);
+    try { localStorage.setItem('ng_theme', name); } catch { /* ignore */ }
+  }
+  try { applyTheme(localStorage.getItem('ng_theme') || 'lemon'); } catch { /* ignore */ }
+  let palette = null;
+  function openPalette() {
+    if (palette || !S.me) return;
+    const input = el('input', { type: 'text', placeholder: 'Type a command or page…', 'aria-label': 'Command' });
+    const list = el('div', { class: 'cmd-list', role: 'listbox' });
+    const go = (h) => () => { location.hash = h; };
+    const cmds = [
+      ...navItems().map(([k, l]) => ({ t: 'Go to ' + l, run: go('#/' + k) })),
+      ...Object.keys(THEMES).map((k) => ({ t: 'Theme: ' + k[0].toUpperCase() + k.slice(1), run: () => { applyTheme(k); toast('Theme: ' + k); } })),
+      { t: 'Turn lockdown mode on', run: () => setLockdown(true) }, { t: 'Turn lockdown mode off', run: () => setLockdown(false) },
+      { t: 'Toggle alarm sound', run: () => { try { localStorage.setItem('ng_sound', soundOn() ? '0' : '1'); } catch { /* ignore */ } toast('Sound ' + (soundOn() ? 'on' : 'off')); route(); } },
+      { t: 'Print incident report', run: () => { location.hash = '#/report'; setTimeout(() => window.print(), 600); } },
+      { t: 'Sign out', run: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } },
+    ];
+    let shown = cmds, idx = 0;
+    const close = () => { palette.remove(); palette = null; document.removeEventListener('keydown', onKey, true); };
+    const paint = () => list.replaceChildren(...(shown.length ? shown.map((c, i) => el('button', { type: 'button', class: 'cmd' + (i === idx ? ' on' : ''), role: 'option', onclick: () => { close(); c.run(); } }, c.t)) : [el('p', { class: 'empty' }, 'No match')]));
+    function onKey(e) {
+      if (e.key === 'Escape') { close(); } else if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(shown.length - 1, idx + 1); paint(); } else if (e.key === 'ArrowUp') { e.preventDefault(); idx = Math.max(0, idx - 1); paint(); }
+      else if (e.key === 'Enter' && shown[idx]) { e.preventDefault(); const c = shown[idx]; close(); c.run(); }
+    }
+    input.addEventListener('input', () => { const q = input.value.toLowerCase(); shown = cmds.filter((c) => c.t.toLowerCase().includes(q)); idx = 0; paint(); });
+    palette = el('div', { class: 'palette', onclick: (e) => { if (e.target === palette) close(); } }, el('div', { class: 'palette-box' }, input, list, el('p', { class: 'muted small' }, 'Enter to run · Esc to close')));
+    document.body.append(palette); document.addEventListener('keydown', onKey, true); paint(); input.focus();
+  }
+  document.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); palette ? palette.querySelector('input').blur() : openPalette(); } });
+
+  // ------------------------------------------------------------------ copilot (rule-based assistant, answers from your own data)
+  function copilotView() {
+    const log = el('div', { class: 'chat', 'aria-live': 'polite' });
+    const input = el('input', { type: 'text', maxlength: 300, placeholder: 'Ask: "Am I safe?", "Who is attacking me?", or paste an IP…', 'aria-label': 'Ask Copilot' });
+    const add = (who, text, links) => {
+      const bubble = el('div', { class: 'msg ' + who }, el('span', { class: 'who' }, who === 'me' ? 'You' : 'NetGuard Copilot'), el('p', {}, ''));
+      log.append(bubble); log.scrollTop = log.scrollHeight;
+      const p = bubble.querySelector('p');
+      if (who === 'me') { p.textContent = text; return; }
+      let i = 0; const step = Math.max(1, Math.round(text.length / 70));
+      const iv = setInterval(() => { i += step; p.textContent = text.slice(0, i); log.scrollTop = log.scrollHeight; if (i >= text.length) { clearInterval(iv); (links || []).forEach((l) => bubble.append(el('a', { class: 'btn sm', href: l.href, style: 'text-decoration:none;display:inline-flex;margin:8px 8px 0 0' }, l.label))); } }, 18);
+    };
+    async function ask(q) {
+      q = q.trim(); if (!q) return; add('me', q); input.value = '';
+      try { const r = await api('POST', '/api/copilot', { question: q }); add('bot', r.answer, r.links); } catch (e) { add('bot', 'Sorry, I could not answer: ' + e.message); }
+    }
+    const chips = ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'Which devices are online?'].map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q));
+    add('bot', 'Hi, I am NetGuard Copilot. I read your alerts, blocks and devices and explain them in plain words. I do not use any outside AI service, so your data never leaves your server.');
+    current = {};
+    return el('section', { class: 'view grid' }, el('div', { class: 'panel pad copilot' },
+      el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'online')),
+      log, el('div', { class: 'chips' }, chips),
+      el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); ask(input.value); } }, el('label', {}, 'Your question', input), el('button', { class: 'btn primary', type: 'submit' }, 'Ask'))));
+  }
+
+  // ------------------------------------------------------------------ tools: IP inspector + threat hunt
+  function toolsView() {
+    const out = el('div', {}), hout = el('div', {});
+    const ipIn = el('input', { type: 'text', placeholder: '203.0.113.50', 'aria-label': 'IP address' });
+    const qIn = el('input', { type: 'text', placeholder: 'e.g. 10.0.4.23, brute, flood, blocked', 'aria-label': 'Search' });
+    async function inspect(ip) {
+      out.replaceChildren(el('p', { class: 'muted' }, 'Checking…'));
+      try {
+        const r = await api('GET', '/api/ip/' + encodeURIComponent(ip.trim()));
+        const tone = r.blocked ? 'crit' : r.allowlisted ? 'ok' : r.alerts.length ? 'warn' : 'accent';
+        out.replaceChildren(el('div', { class: 'verdict', 'data-tone': tone }, el('div', { class: 'mono ip' }, r.ip), el('p', {}, r.verdict)),
+          el('div', { class: 'inline', style: 'margin:10px 0' },
+            !r.blocked && !r.protected && !r.allowlisted ? el('button', { class: 'btn danger', onclick: async () => { try { await api('POST', '/api/blocks', { ip: r.ip, reason: 'Blocked from IP Inspector' }); toast('Blocked ' + r.ip); inspect(r.ip); } catch (e) { toast(e.message, true); } } }, 'Block this IP') : null,
+            !r.allowlisted && !r.protected ? el('button', { class: 'btn', onclick: async () => { try { await api('POST', '/api/allowlist', { ip: r.ip, note: 'Added from IP Inspector' }); toast('Allowlisted'); inspect(r.ip); } catch (e) { toast(e.message, true); } } }, 'Trust this IP') : null),
+          r.alerts.length ? el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['When', 'Severity', 'What happened', 'Action'].map((h) => el('th', {}, h)))), el('tbody', {}, r.alerts.map((a) => el('tr', {}, el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, el('span', { class: 'sev ' + a.severity }, a.severity)), el('td', {}, a.title), el('td', {}, a.action || '—')))))) : el('p', { class: 'muted' }, 'No history for this address.'));
+      } catch (e) { out.replaceChildren(el('p', { class: 'err' }, e.message)); }
+    }
+    async function hunt(q) {
+      hout.replaceChildren(el('p', { class: 'muted' }, 'Searching…'));
+      try {
+        const r = await api('GET', '/api/hunt?q=' + encodeURIComponent(q));
+        hout.replaceChildren(
+          el('h3', { class: 'sub' }, `Alerts (${r.alerts.length})`),
+          r.alerts.length ? el('div', { class: 'tablewrap' }, el('table', {}, el('tbody', {}, r.alerts.map((a) => el('tr', {}, el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, el('span', { class: 'sev ' + a.severity }, a.severity)), el('td', {}, a.title), el('td', { class: 'mono' }, a.src_ip || '—')))))) : el('p', { class: 'muted' }, 'No matching alerts.'),
+          el('h3', { class: 'sub' }, `Log lines (${r.logs.length})`),
+          r.logs.length ? el('div', { class: 'logs', style: 'height:auto;max-height:280px' }, r.logs.map((l) => el('div', { class: 'row ' + l.level }, el('span', { class: 't' }, fmtTime(l.ts)), el('span', { class: 'l' }, l.level), el('span', { class: 'm' }, l.msg)))) : el('p', { class: 'muted' }, 'No matching log lines.'));
+      } catch (e) { hout.replaceChildren(el('p', { class: 'err' }, e.message)); }
+    }
+    const pre = (location.hash.match(/[?&]ip=([\w.:]+)/) || [])[1];
+    if (pre) { ipIn.value = pre; setTimeout(() => inspect(pre), 0); }
+    current = {};
+    return el('section', { class: 'view grid' },
+      el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'IP inspector')), el('p', { class: 'muted', style: 'margin-bottom:10px' }, 'Check any address against everything NetGuard has seen, then block or trust it in one click.'),
+        el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); inspect(ipIn.value); } }, el('label', {}, 'IP address', ipIn), el('button', { class: 'btn primary', type: 'submit' }, 'Inspect')), out),
+      canaryPanel(), toolkitPanel(),
+      el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Threat hunt')), el('p', { class: 'muted', style: 'margin-bottom:10px' }, 'Search all alerts and logs by IP, attack type, device or any word.'),
+        el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); hunt(qIn.value); } }, el('label', {}, 'Search', qIn), el('button', { class: 'btn primary', type: 'submit' }, 'Hunt')), hout));
+  }
+
+  // ------------------------------------------------------------------ incident report (print to PDF)
+  function reportView() {
+    const body = el('div', { class: 'report-body' });
+    current = {};
+    (async () => {
+      await Promise.all([loadAlerts(), loadInsights()]);
+      const I = S.ins || { timeline: [], attackers: [], by_type: [], factors: [] }, total = I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0);
+      const mx = Math.max(1, ...I.timeline.map((b) => b.critical + b.high + b.other));
+      body.replaceChildren(
+        el('div', { class: 'rep-grid' },
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Security score'), el('b', {}, I.score == null ? '—' : I.score + '/100')),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Alerts, 24 h'), el('b', {}, total)),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Attackers, 7 d'), el('b', {}, I.attackers.length)),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Currently blocked'), el('b', {}, S.stats.active_blocks ?? 0))),
+        el('h3', { class: 'sub' }, 'Alerts per hour, last 24 hours'),
+        el('div', { class: 'rep-bars' }, I.timeline.map((b) => { const n = b.critical + b.high + b.other; return el('i', { style: `height:${Math.max(3, (n / mx) * 100)}%`, title: n + ' alerts', class: b.critical ? 'c' : b.high ? 'h' : '' }); })),
+        el('h3', { class: 'sub' }, 'Top attackers'),
+        I.attackers.length ? el('table', {}, el('thead', {}, el('tr', {}, ['IP', 'Attack types', 'Alerts', 'Last seen', 'Status'].map((h) => el('th', {}, h)))), el('tbody', {}, I.attackers.map((a) => el('tr', {}, el('td', { class: 'mono' }, a.ip), el('td', {}, a.types.map(typeLabel).join(', ')), el('td', {}, a.alerts), el('td', {}, ago(a.last)), el('td', {}, a.blocked ? 'Blocked' : 'Not blocked'))))) : el('p', { class: 'muted' }, 'No attackers in the last 7 days.'),
+        el('h3', { class: 'sub' }, 'Recent alerts'),
+        S.alerts.length ? el('table', {}, el('thead', {}, el('tr', {}, ['Time', 'Severity', 'What happened', 'Source', 'Action'].map((h) => el('th', {}, h)))), el('tbody', {}, S.alerts.slice(0, 20).map((a) => el('tr', {}, el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, a.severity), el('td', {}, a.title), el('td', { class: 'mono' }, a.src_ip || '—'), el('td', {}, a.action || '—'))))) : el('p', { class: 'muted' }, 'No alerts recorded.'),
+        el('h3', { class: 'sub' }, 'Recommendations'),
+        el('ul', { class: 'recs' }, (I.factors.length ? I.factors : [{ fix: 'No action needed. Keep reviewing alerts weekly.' }]).map((f) => el('li', {}, f.fix))));
+    })();
+    return el('section', { class: 'view panel pad report' },
+      el('div', { class: 'head' }, el('h2', {}, 'Incident report'), el('span', { class: 'meta noprint' }, el('button', { class: 'btn primary sm', type: 'button', onclick: () => window.print() }, 'Print / save as PDF'))),
+      el('p', { class: 'muted', style: 'margin-bottom:14px' }, 'Generated ' + new Date().toLocaleString() + ' for ' + S.me.email), body);
+  }
+
+  // ------------------------------------------------------------------ war room (full-screen mission control for the projector)
+  function warRoomView() {
+    const radar = el('canvas', { role: 'img', 'aria-label': 'Threat radar' }), feed = el('div', { class: 'wr-feed' });
+    const big = (id, k) => el('div', { class: 'wr-k' }, el('span', { class: 'k' }, k), el('b', { id }, '—'));
+    const clock = el('div', { class: 'wr-clock mono' });
+    let alive = true; const t0 = performance.now();
+    const hashN = (str, salt) => { let h = 2166136261 ^ salt; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 10000) / 10000; };
+    function draw(now) {
+      if (!alive) return;
+      const dpr = window.devicePixelRatio || 1, w = radar.clientWidth, h = radar.clientHeight;
+      if (w && h) {
+        if (radar.width !== w * dpr || radar.height !== h * dpr) { radar.width = w * dpr; radar.height = h * dpr; }
+        const g = radar.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+        const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 12, ang = ((now - t0) / 3600) * Math.PI * 2;
+        g.lineWidth = 1; g.strokeStyle = 'rgba(166,107,255,.45)';
+        for (let i = 1; i <= 5; i++) { g.beginPath(); g.arc(cx, cy, (R / 5) * i, 0, 7); g.stroke(); }
+        for (let i = 0; i < 12; i++) { g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(i * Math.PI / 6) * R, cy + Math.sin(i * Math.PI / 6) * R); g.stroke(); }
+        if (g.createConicGradient) { const gr = g.createConicGradient(ang - 1.2, cx, cy); gr.addColorStop(0, 'rgba(255,242,26,0)'); gr.addColorStop(0.19, 'rgba(255,242,26,.42)'); gr.addColorStop(0.191, 'rgba(255,242,26,0)'); g.fillStyle = gr; g.beginPath(); g.arc(cx, cy, R, 0, 7); g.fill(); }
+        g.strokeStyle = '#FFF21A'; g.lineWidth = 2.5; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(ang) * R, cy + Math.sin(ang) * R); g.stroke();
+        g.fillStyle = '#FFF21A'; g.beginPath(); g.arc(cx, cy, 8, 0, 7); g.fill();
+        for (const a of (S.ins && S.ins.attackers) || []) {
+          const th = hashN(a.ip, 1) * Math.PI * 2, rr = (0.25 + hashN(a.ip, 2) * 0.68) * R, x = cx + Math.cos(th) * rr, y = cy + Math.sin(th) * rr;
+          g.font = '12px IBM Plex Mono, monospace'; g.textAlign = 'center';
+          if (a.blocked) { g.strokeStyle = '#FFF21A'; g.lineWidth = 3; g.beginPath(); g.moveTo(x - 8, y - 8); g.lineTo(x + 8, y + 8); g.moveTo(x + 8, y - 8); g.lineTo(x - 8, y + 8); g.stroke(); g.fillStyle = '#FFF21A'; }
+          else { const p = (Math.sin(now / 180) + 1) / 2; g.fillStyle = 'rgba(255,85,87,.35)'; g.beginPath(); g.arc(x, y, 12 + p * 10, 0, 7); g.fill(); g.fillStyle = '#ff5557'; g.beginPath(); g.arc(x, y, 8, 0, 7); g.fill(); g.fillStyle = '#ffd0d0'; }
+          g.fillText(a.ip, x, y + 26);
+        }
+      }
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+    function paint() {
+      const set = (id, v) => { const n = document.getElementById(id); if (n) n.textContent = v; };
+      const I = S.ins; set('wScore', I && I.score != null ? I.score : '—'); set('wBlocked', S.stats.active_blocks ?? 0); set('wOpen', S.stats.open_alerts ?? 0);
+      set('wAtk', I ? I.attackers.filter((a) => !a.blocked).length : 0);
+      clock.textContent = new Date().toLocaleTimeString([], { hour12: false });
+      feed.replaceChildren(...S.logs.slice(-14).reverse().map((l) => el('div', { class: 'row ' + l.level }, el('span', { class: 't' }, fmtTime(l.ts)), el('span', { class: 'l' }, l.level), el('span', { class: 'm' }, l.msg))));
+      document.getElementById('glow').className = S.banner && !S.banner.good ? 'on' : '';
+    }
+    const iv = setInterval(paint, 1000); const iv2 = setInterval(loadInsights, 8000);
+    current = { tick: paint, logTick: paint, refresh: paint, cleanup: () => { alive = false; clearInterval(iv); clearInterval(iv2); document.getElementById('glow').className = ''; } };
+    (async () => { await Promise.all([loadAlerts(), refreshStats(), loadInsights()]); if (!S.logs.length) S.logs = await api('GET', '/api/logs?limit=30'); paint(); })();
+    const fs = el('button', { class: 'btn sm', type: 'button', onclick: () => { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); } }, 'Full screen');
+    return el('section', { class: 'view wr' },
+      el('div', { class: 'wr-top' }, el('h2', {}, 'NetGuard war room'), el('span', { class: 'meta' }, clock, fs)),
+      el('div', { class: 'wr-main' }, el('div', { class: 'panel wr-radar' }, radar), el('div', { class: 'wr-side' }, big('wScore', 'Security score'), big('wAtk', 'Active attackers'), big('wBlocked', 'Blocked now'), big('wOpen', 'Open alerts'))),
+      el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Live feed'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'streaming')), feed));
+  }
+
+  // ------------------------------------------------------------------ canary traps + security toolkit (used by the Tools page)
+  function canaryPanel() {
+    const list = el('div', {}), label = el('input', { type: 'text', maxlength: 60, placeholder: 'e.g. Fake admin panel', 'aria-label': 'Trap name' });
+    async function paint() {
+      const rows = await api('GET', '/api/canaries');
+      list.replaceChildren(...(rows.length ? rows.map((c) => { const url = location.origin + '/c/' + c.token; return el('div', { class: 'trap' },
+        el('div', {}, el('strong', {}, c.label), el('div', { class: 'muted small' }, c.hits ? `Triggered ${c.hits} time${c.hits === 1 ? '' : 's'}, last ${ago(c.last_hit)}` : 'Not triggered yet')),
+        el('div', { class: 'codeblock', style: 'user-select:all;margin:6px 0' }, url),
+        el('div', { class: 'inline' }, el('button', { class: 'btn sm', onclick: async () => { try { await navigator.clipboard.writeText(url); toast('Link copied'); } catch { toast('Select the link and copy it', true); } } }, 'Copy link'), el('button', { class: 'btn sm', onclick: () => window.open('/c/' + c.token, '_blank', 'noopener') }, 'Test it'), el('button', { class: 'btn sm danger', onclick: async () => { await api('DELETE', '/api/canaries/' + c.id); paint(); } }, 'Delete'))); }) : [el('p', { class: 'empty' }, 'No traps yet.')]));
+    }
+    paint();
+    return el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Canary traps')),
+      el('p', { class: 'muted', style: 'margin-bottom:10px;max-width:75ch' }, 'A trap is a link no real person should ever open. Hide it in a fake admin page, a robots.txt entry or a decoy file. The moment someone opens it, NetGuard raises a critical alert and blocks their IP. The link always looks like an ordinary missing page, so attackers learn nothing.'),
+      el('form', { class: 'inline', onsubmit: async (e) => { e.preventDefault(); try { await api('POST', '/api/canaries', { label: label.value }); label.value = ''; paint(); } catch (x) { toast(x.message, true); } } }, el('label', {}, 'Trap name', label), el('button', { class: 'btn primary', type: 'submit' }, 'Create trap')), list);
+  }
+  function toolkitPanel() {
+    // password lab
+    const pw = el('input', { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'Type a password to test (stays in your browser)', 'aria-label': 'Password to test' });
+    const meter = el('div', { class: 'meter' }, el('i', {})), verdict = el('p', { class: 'muted' }, 'Nothing is sent anywhere. The test runs entirely in this page.');
+    pw.addEventListener('input', () => {
+      const v = pw.value; if (!v) { meter.firstChild.style.cssText = 'width:0'; verdict.textContent = 'Nothing is sent anywhere. The test runs entirely in this page.'; return; }
+      let pool = 0; if (/[a-z]/.test(v)) pool += 26; if (/[A-Z]/.test(v)) pool += 26; if (/\d/.test(v)) pool += 10; if (/[^\w]/.test(v)) pool += 33;
+      let bits = v.length * Math.log2(Math.max(pool, 2));
+      const common = /(password|qwerty|letmein|admin|welcome|iloveyou|123456|abc123|111111)/i.test(v); if (common) bits = Math.min(bits, 24);
+      if (/(.)\1{2,}/.test(v)) bits -= 8; if (/^(?:19|20)\d\d$/.test(v) || /^\d+$/.test(v)) bits = Math.min(bits, 28);
+      bits = Math.max(0, bits);
+      const secs = Math.pow(2, bits) / 2 / 1e10, human = secs < 1 ? 'instantly' : secs < 60 ? Math.round(secs) + ' seconds' : secs < 3600 ? Math.round(secs / 60) + ' minutes' : secs < 86400 ? Math.round(secs / 3600) + ' hours' : secs < 3.15e7 ? Math.round(secs / 86400) + ' days' : secs < 3.15e9 ? Math.round(secs / 3.15e7) + ' years' : 'centuries';
+      const pct = Math.min(100, Math.round((bits / 80) * 100)), lvl = bits < 36 ? 'Weak' : bits < 60 ? 'Okay' : 'Strong';
+      meter.firstChild.style.cssText = `width:${pct}%;background:${bits < 36 ? '#ff5557' : bits < 60 ? '#C8792C' : '#FFF21A'}`;
+      verdict.textContent = `${lvl}. About ${Math.round(bits)} bits. A fast attacker could crack it in ${human}.` + (common ? ' It contains a very common word or pattern.' : '') + (v.length < 12 ? ' Use at least 12 characters.' : '');
+    });
+    // hash
+    const hin = el('input', { type: 'text', placeholder: 'Text to hash', 'aria-label': 'Text to hash' }), hout = el('div', { class: 'codeblock', style: 'white-space:pre-wrap;word-break:break-all' }, '');
+    const doHash = async () => { try { const buf = new TextEncoder().encode(hin.value); const lines = []; for (const alg of ['SHA-256', 'SHA-512']) { const d = await crypto.subtle.digest(alg, buf); lines.push(alg + '\n' + [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')); } hout.textContent = lines.join('\n\n'); } catch { hout.textContent = 'Hashing needs a secure (https) page.'; } };
+    hin.addEventListener('input', doHash);
+    // base64 / jwt
+    const din = el('input', { type: 'text', placeholder: 'Paste Base64 text or a JWT token', 'aria-label': 'Base64 or JWT' }), dout = el('div', { class: 'codeblock', style: 'white-space:pre-wrap;word-break:break-all' }, '');
+    const b64 = (x) => decodeURIComponent(escape(atob(x.replace(/-/g, '+').replace(/_/g, '/'))));
+    din.addEventListener('input', () => {
+      const v = din.value.trim(); if (!v) { dout.textContent = ''; return; }
+      try {
+        const parts = v.split('.');
+        if (parts.length === 3) dout.textContent = 'JWT header\n' + JSON.stringify(JSON.parse(b64(parts[0])), null, 2) + '\n\nJWT payload\n' + JSON.stringify(JSON.parse(b64(parts[1])), null, 2) + '\n\n(The signature is not verified here.)';
+        else dout.textContent = 'Decoded\n' + b64(v);
+      } catch { dout.textContent = 'Not valid Base64 or JWT.'; }
+    });
+    return el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Security toolkit')),
+      el('div', { class: 'toolkit' },
+        el('div', {}, el('h3', { class: 'sub' }, 'Password lab'), el('label', {}, 'Password', pw), meter, verdict),
+        el('div', {}, el('h3', { class: 'sub' }, 'Hash generator'), el('label', {}, 'Text', hin), hout),
+        el('div', {}, el('h3', { class: 'sub' }, 'Base64 and JWT decoder'), el('label', {}, 'Input', din), dout)));
+  }
+
   // ------------------------------------------------------------------ router
-  const VIEWS = { dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, simulator: simulatorView, settings: settingsView };
+  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, simulator: simulatorView, settings: settingsView };
   function route() {
     if (current.cleanup) { current.cleanup(); }
     current = { refresh: null };
@@ -449,5 +796,6 @@
   }
   window.addEventListener('hashchange', route);
   setInterval(() => { if (current.tick && S.me) current.tick(); }, 5000);
+  setInterval(() => { if (current.insights && S.me) loadInsights(); }, 15000);
   boot();
 })();

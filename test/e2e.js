@@ -115,6 +115,36 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const simAlerts = (await call('GET', '/api/alerts')).data;
   ok(simAlerts.some((a) => a.type === 'flood' && /^Blocked/.test(a.action)), 'simulator attack was auto-blocked');
 
+  console.log('insights + export');
+  const ins = (await call('GET', '/api/insights')).data;
+  ok(typeof ins.score === 'number' && ins.score <= 100 && Array.isArray(ins.factors), 'security score computed with fixes');
+  ok(ins.timeline.length === 24 && ins.timeline.some((b) => b.critical + b.high + b.other > 0), '24h timeline has the alerts');
+  ok(ins.attackers.length > 0 && ins.attackers[0].ip && ins.by_type.length > 0, 'top attackers and attack types listed');
+  const csvRes = await fetch(base + '/api/alerts.csv', { headers: { Cookie: cookie } });
+  const csv = await csvRes.text();
+  ok(csvRes.status === 200 && /text\/csv/.test(csvRes.headers.get('content-type')) && csv.startsWith('time_utc,severity') && csv.split('\n').length > 2, 'alerts export as CSV');
+  ok((await fetch(base + '/api/alerts.csv')).status === 401, 'CSV export needs sign-in');
+
+  console.log('copilot, inspector, hunt');
+  const cp = (q) => call('POST', '/api/copilot', { question: q });
+  ok(/security score|no real devices/i.test((await cp('am i safe?')).data.answer), 'copilot answers safety question');
+  ok(/attacker|No attackers/i.test((await cp('who is attacking me')).data.answer), 'copilot lists attackers');
+  ok((await cp('what happened today')).data.links.length > 0, 'copilot summary links to report');
+  const atkIp = (await call('GET', '/api/insights')).data.attackers[0].ip;
+  ok(/Dangerous|Suspicious/.test((await call('GET', '/api/ip/' + atkIp)).data.verdict), 'IP inspector flags an attacker');
+  ok((await call('GET', '/api/ip/not-an-ip')).status === 400, 'IP inspector rejects junk');
+  ok((await call('GET', '/api/hunt?q=' + encodeURIComponent('flood'))).data.alerts.length > 0, 'threat hunt finds alerts');
+  ok((await call('GET', '/api/hunt?q=%25%25')).data.alerts.length === 0, 'hunt escapes SQL wildcards');
+
+  console.log('canary traps');
+  const trap = (await call('POST', '/api/canaries', { label: 'Fake admin' })).data;
+  ok(/^[\w-]{10,}$/.test(trap.token), 'trap link created');
+  ok((await fetch(base + '/c/' + trap.token)).status === 404, 'trap looks like a normal missing page');
+  const tAlerts = (await call('GET', '/api/alerts')).data;
+  ok(tAlerts.some((x) => x.type === 'canary' && x.severity === 'critical'), 'opening the trap raises a critical alert');
+  ok((await call('GET', '/api/canaries')).data[0].hits === 1, 'trap counts its hits');
+  ok((await fetch(base + '/c/doesnotexist')).status === 404, 'unknown trap tokens are harmless');
+
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();
   process.exit(fail ? 1 : 0);

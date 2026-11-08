@@ -251,6 +251,149 @@ route('GET', '/api/stats', 'user', async (req, res, ctx) => {
 route('GET', '/api/logs', 'user', async (req, res, ctx) =>
   send(res, 200, db.prepare('SELECT id,ts,level,msg,device_id FROM logs WHERE user_id=? ORDER BY id DESC LIMIT ?').all(ctx.user.id, clamp(ctx.query.get('limit'), 1, 500, 80)).reverse()));
 
+// ------------------------------------------------------------------ insights, export
+function insightsFor(u) {
+  const t = now(), cfg = getSettings(u);
+  const devs = db.prepare('SELECT status, enforce, virtual FROM devices WHERE user_id=? AND virtual=0').all(u);
+  const open = db.prepare("SELECT severity, COUNT(*) c FROM alerts WHERE user_id=? AND status='open' GROUP BY severity").all(u);
+  const n = (sev) => (open.find((o) => o.severity === sev) || { c: 0 }).c;
+  // security score: starts at 100, loses points for real, fixable problems; each one comes with the fix
+  const factors = [];
+  const hit = (label, pts, fix) => { if (pts > 0) factors.push({ label, points: pts, fix }); };
+  hit(`${n('critical')} open critical alert(s)`, Math.min(45, n('critical') * 15), 'Review and resolve them on the Alerts page');
+  hit(`${n('high')} open high alert(s)`, Math.min(21, n('high') * 7), 'Acknowledge or resolve them on the Alerts page');
+  hit(`${n('medium')} open medium alert(s)`, Math.min(10, n('medium') * 2), 'Acknowledge or resolve them');
+  if (!cfg.auto_block) hit('Automatic blocking is off', 10, 'Turn on "Block attackers automatically" in Settings');
+  const off = devs.filter((d) => d.status === 'offline').length;
+  hit(`${off} device(s) offline`, Math.min(16, off * 8), 'Check that the agent is still running on them');
+  const mon = devs.filter((d) => d.status === 'online' && !d.enforce).length;
+  hit(`${mon} device(s) in monitor-only mode`, Math.min(10, mon * 5), 'Restart the agent with --enforce so it can block');
+  if (!cfg.webhook_url) hit('No notifications set up', 3, 'Add a Slack or Discord webhook in Settings');
+  const score = devs.length ? Math.max(0, 100 - factors.reduce((a, f) => a + f.points, 0)) : null;
+  if (!devs.length) factors.length = 0;
+
+  const since24 = t - 86400000;
+  const buckets = Array.from({ length: 24 }, (_, i) => ({ start: since24 + i * 3600000, critical: 0, high: 0, other: 0 }));
+  for (const a of db.prepare('SELECT created, severity FROM alerts WHERE user_id=? AND created>?').all(u, since24)) {
+    const b = buckets[Math.min(23, Math.floor((a.created - since24) / 3600000))];
+    if (a.severity === 'critical') b.critical++; else if (a.severity === 'high') b.high++; else b.other++;
+  }
+  const since7 = t - 7 * 86400000;
+  const by_type = db.prepare('SELECT type, COUNT(*) c FROM alerts WHERE user_id=? AND created>? GROUP BY type ORDER BY c DESC').all(u, since7);
+  const attackers = db.prepare("SELECT src_ip ip, COUNT(*) alerts, MAX(created) last, GROUP_CONCAT(DISTINCT type) types FROM alerts WHERE user_id=? AND src_ip IS NOT NULL AND created>? GROUP BY src_ip ORDER BY alerts DESC, last DESC LIMIT 6").all(u, since7)
+    .map((a) => ({ ...a, types: String(a.types || '').split(','), blocked: !!db.prepare('SELECT 1 FROM blocks WHERE user_id=? AND ip=? AND active=1').get(u, a.ip) }));
+  return { score, factors, timeline: buckets, by_type, attackers, auto_block: !!cfg.auto_block, sensitivity: cfg.sensitivity };
+}
+route('GET', '/api/insights', 'user', async (req, res, ctx) => send(res, 200, insightsFor(ctx.user.id)));
+
+route('GET', '/api/alerts.csv', 'user', async (req, res, ctx) => {
+  const cell = (v) => { let s = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  const rows = db.prepare('SELECT * FROM alerts WHERE user_id=? ORDER BY created DESC LIMIT 5000').all(ctx.user.id);
+  const csv = ['time_utc,severity,type,title,source_ip,device,action,status,count']
+    .concat(rows.map((a) => [new Date(a.created).toISOString(), a.severity, a.type, a.title, a.src_ip, a.device_name, a.action, a.status, a.count].map(cell).join(','))).join('\r\n');
+  res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="netguard-alerts.csv"', 'Cache-Control': 'no-store', ...HEADERS });
+  res.end(csv);
+});
+
+// ------------------------------------------------------------------ IP inspector, threat hunt, copilot
+const LABEL = { flood: 'traffic flood', port_scan: 'port scan', brute_force: 'brute-force login', conn_flood: 'connection flood', exposed_port: 'exposed service', physical_anomaly: 'physical event', traffic_drop: 'traffic drop', device_offline: 'device offline', canary: 'canary trap' };
+const lab = (t) => LABEL[t] || String(t).replace(/_/g, ' ');
+const ago = (ts) => { const m = Math.round((now() - ts) / 60000); return m < 1 ? 'just now' : m < 90 ? m + ' min ago' : m < 2880 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' days ago'; };
+function ipReport(u, ip) {
+  const alerts = db.prepare('SELECT id,created,type,severity,title,action,status FROM alerts WHERE user_id=? AND src_ip=? ORDER BY created DESC LIMIT 30').all(u, ip);
+  const blocks = db.prepare('SELECT reason,source,created,expires,active FROM blocks WHERE user_id=? AND ip=? ORDER BY created DESC LIMIT 10').all(u, ip);
+  const allow = db.prepare('SELECT note FROM allowlist WHERE user_id=? AND ip=?').get(u, ip);
+  const protectedWhy = engine.protectedReason(u, ip) || null;
+  const types = [...new Set(alerts.map((a) => a.type))];
+  const active = blocks.some((b) => b.active);
+  let verdict = 'Unknown: NetGuard has never seen this address.';
+  if (allow) verdict = 'Trusted: this address is on your allowlist.';
+  else if (protectedWhy) verdict = 'Protected: ' + protectedWhy + '.';
+  else if (active) verdict = 'Dangerous: currently blocked.';
+  else if (alerts.length) verdict = `Suspicious: caused ${alerts.length} alert(s) (${types.map(lab).join(', ')}).`;
+  return { ip, verdict, allowlisted: !!allow, protected: protectedWhy, blocked: active, first_seen: alerts.length ? alerts[alerts.length - 1].created : null, last_seen: alerts.length ? alerts[0].created : null, alerts, blocks };
+}
+route('GET', '/api/ip/:ip', 'user', async (req, res, ctx) => send(res, 200, ipReport(ctx.user.id, checkIp(ctx.params.ip))));
+
+route('GET', '/api/hunt', 'user', async (req, res, ctx) => {
+  const q = String(ctx.query.get('q') || '').trim().slice(0, 80);
+  if (q.length < 2) throw bad('Type at least 2 characters');
+  const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+  const alerts = db.prepare("SELECT id,created,type,severity,title,src_ip,device_name,action,status FROM alerts WHERE user_id=? AND (title LIKE ? ESCAPE '\\' OR src_ip LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\' OR device_name LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\') ORDER BY created DESC LIMIT 50").all(ctx.user.id, like, like, like, like, like);
+  const logs = db.prepare("SELECT id,ts,level,msg FROM logs WHERE user_id=? AND msg LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 50").all(ctx.user.id, like);
+  send(res, 200, { alerts, logs });
+});
+
+// A rule-based security assistant. It answers only from this user's own data (no outside AI service).
+route('POST', '/api/copilot', 'user', async (req, res, ctx) => {
+  if (!auth.rateLimit('cop:' + ctx.user.id, 60, 60000)) throw bad('Slow down', 429);
+  const u = ctx.user.id, q = String(ctx.body.question || '').toLowerCase().slice(0, 300), I = insightsFor(u);
+  const links = [];
+  let ans;
+  const ipm = q.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+  const total24 = I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0);
+  const devs = db.prepare('SELECT name,status,enforce FROM devices WHERE user_id=? AND virtual=0').all(u);
+  if (ipm && cleanIp(ipm[0])) {
+    const r = ipReport(u, cleanIp(ipm[0]));
+    ans = `${r.ip}: ${r.verdict}` + (r.last_seen ? ` Last seen ${ago(r.last_seen)}.` : '');
+    if (!r.blocked && !r.allowlisted && !r.protected && r.alerts.length) links.push({ label: 'Open in IP Inspector', href: '#/tools?ip=' + r.ip });
+  } else if (/safe|score|secur|protect|risk/.test(q)) {
+    ans = I.score == null ? 'You have no real devices yet, so there is nothing to score. Add a device on the Devices page.' : `Your security score is ${I.score}/100 (${I.score >= 85 ? 'well protected' : I.score >= 60 ? 'needs attention' : 'at risk'}).` + (I.factors.length ? ' To raise it: ' + I.factors.map((f) => `${f.fix.toLowerCase()} (+${f.points})`).join('; ') + '.' : ' Nothing needs fixing.');
+  } else if (/who|attack|top|hacker|ip/.test(q) && !/how|what should/.test(q)) {
+    ans = I.attackers.length ? 'Top attackers this week: ' + I.attackers.slice(0, 4).map((a) => `${a.ip} (${a.types.map(lab).join(', ')}, ${a.blocked ? 'blocked' : 'NOT blocked'})`).join('; ') + '.' : 'No attackers seen in the last 7 days.';
+    if (I.attackers.some((a) => !a.blocked)) links.push({ label: 'Block them on the dashboard', href: '#/dashboard' });
+  } else if (/do|fix|improve|recommend|advice|should|next|help me/.test(q)) {
+    ans = I.factors.length ? 'My recommendations, most important first: ' + I.factors.sort((a, b) => b.points - a.points).map((f, i) => `${i + 1}. ${f.fix}`).join(' ') : 'Everything looks healthy. Keep your agents updated and review alerts weekly.';
+    links.push({ label: 'Open Settings', href: '#/settings' });
+  } else if (/block/.test(q)) {
+    const n = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1').get(u).c;
+    ans = `${n} address(es) are blocked right now. Automatic blocking is ${I.auto_block ? 'on' : 'OFF'}.`; links.push({ label: 'Open Blocklist', href: '#/blocks' });
+  } else if (/device|agent|online|offline|server/.test(q)) {
+    ans = devs.length ? devs.map((d) => `${d.name}: ${d.status}${d.status === 'online' ? (d.enforce ? ', enforcing' : ', monitor-only') : ''}`).join('. ') + '.' : 'No devices yet.';
+    links.push({ label: 'Open Devices', href: '#/devices' });
+  } else if (/today|happen|summary|status|report|24|hour|overview|going on/.test(q)) {
+    const worst = I.by_type[0];
+    ans = total24 ? `In the last 24 hours NetGuard raised ${total24} alert(s)` + (worst ? `, mostly ${lab(worst.type)}` : '') + `. ${I.attackers.filter((a) => a.blocked).length} attacker(s) are blocked. Security score: ${I.score == null ? 'n/a' : I.score + '/100'}.` : 'Quiet day: no alerts in the last 24 hours.';
+    links.push({ label: 'Open full incident report', href: '#/report' });
+  } else {
+    ans = 'I can answer from your own data. Try: "Am I safe?", "What happened today?", "Who is attacking me?", "What should I do?", "Which devices are online?", or paste an IP address to check it.';
+  }
+  send(res, 200, { answer: ans, links });
+});
+
+// ------------------------------------------------------------------ canary traps (honeytokens)
+// A trap URL looks like a forgotten admin link. Nobody legitimate ever opens it, so whoever does is flagged and blocked.
+const crypto = require('node:crypto');
+route('GET', '/api/canaries', 'user', async (req, res, ctx) => send(res, 200, db.prepare('SELECT id,token,label,hits,last_hit,created FROM canaries WHERE user_id=? ORDER BY id DESC').all(ctx.user.id)));
+route('POST', '/api/canaries', 'user', async (req, res, ctx) => {
+  const label = String(ctx.body.label || '').trim().slice(0, 60) || 'Trap link';
+  if (db.prepare('SELECT COUNT(*) c FROM canaries WHERE user_id=?').get(ctx.user.id).c >= 20) throw bad('You can have up to 20 traps');
+  const token = crypto.randomBytes(9).toString('base64url');
+  db.prepare('INSERT INTO canaries(user_id,token,label,created) VALUES(?,?,?,?)').run(ctx.user.id, token, label, now());
+  send(res, 201, { token, label });
+});
+route('DELETE', '/api/canaries/:id', 'user', async (req, res, ctx) => {
+  db.prepare('DELETE FROM canaries WHERE id=? AND user_id=?').run(Number(ctx.params.id), ctx.user.id);
+  send(res, 200, { ok: true });
+});
+function triggerCanary(c, ip, ua) {
+  const t = now(), u = c.user_id, cfg = getSettings(u);
+  db.prepare('UPDATE canaries SET hits=hits+1,last_hit=? WHERE id=?').run(t, c.id);
+  const recent = db.prepare("SELECT id FROM alerts WHERE user_id=? AND type='canary' AND src_ip=? AND created>?").get(u, ip, t - 60000);
+  if (recent) { db.prepare('UPDATE alerts SET count=count+1, updated=? WHERE id=?').run(t, recent.id); return; }
+  const title = `Trap "${c.label}" was opened by ${ip}`;
+  const r = db.prepare('INSERT INTO alerts(user_id,device_id,device_name,type,severity,src_ip,title,detail,status,count,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(u, null, 'Canary trap', 'canary', 'critical', ip, title.slice(0, 300), JSON.stringify({ trap: c.label, user_agent: String(ua || '').slice(0, 200) }), 'open', 1, t, t);
+  const id = Number(r.lastInsertRowid);
+  let action = 'Trap triggered. Anyone opening it is probing where they should not be.';
+  const why = engine.protectedReason(u, ip);
+  if (why) action = `Not blocked: ${why}`;
+  else if (cfg.auto_block) { engine.addBlock(u, { ip, reason: title, source: 'auto', scope: 'fleet', alertId: id, ttlMin: cfg.block_ttl_min }); action = `Blocked ${ip} on all your devices`; }
+  db.prepare('UPDATE alerts SET action=? WHERE id=?').run(action, id);
+  hub.emit(u, 'alert', engine.publicAlert(db.prepare('SELECT * FROM alerts WHERE id=?').get(id)));
+  engine.log(u, null, 'CRIT', `${title} | ${action}`);
+}
+
 // ------------------------------------------------------------------ simulator
 route('POST', '/api/sim/attack', 'user', async (req, res, ctx) => {
   if (!['cyber', 'scan', 'brute', 'spark'].includes(ctx.body.type)) throw bad('Unknown attack type');
@@ -317,6 +460,13 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method !== 'GET' && req.method !== 'DELETE') ctx.body = await readBody(req);
       return await r.handler(req, res, ctx);
+    }
+
+    // canary trap: always answers like an ordinary missing page, so attackers learn nothing
+    if (req.method === 'GET' && url.pathname.startsWith('/c/')) {
+      const c = db.prepare('SELECT * FROM canaries WHERE token=?').get(url.pathname.slice(3, 40));
+      if (c && ip !== 'unknown') { try { triggerCanary(c, ip, req.headers['user-agent']); } catch { /* never break the response */ } }
+      return send(res, 404, { error: 'Not found' });
     }
 
     // downloads + static files

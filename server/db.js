@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS logs (
   msg TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS logs_user ON logs(user_id, id DESC);
+CREATE TABLE IF NOT EXISTS canaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 0,
+  last_hit INTEGER,
+  created INTEGER NOT NULL
+);
 `);
 
 module.exports = { db, DATA_DIR };

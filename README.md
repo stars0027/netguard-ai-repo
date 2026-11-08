@@ -1,4 +1,4 @@
-n# NetGuard AI
+# NetGuard AI
 
 A multi-user network defense platform. Users sign up, install a small **agent** on the machines they
 want to protect, and NetGuard **learns normal traffic, detects attacks, blocks the attacker in the OS
@@ -94,3 +94,11 @@ public/   index.html styles.css app.js   (no build step)
 agent/    netguard_agent.py
 test/     e2e.js                          (37 checks against a live server)
 ```
+
+
+## v2 additions
+- Security score (0-100) with the exact fixes that raise it
+- 24-hour alert timeline, attack-type breakdown, top attackers with one-click block
+- Alarm sound and browser notification for serious alerts (toggle in the header)
+- Alerts export as CSV (`/api/alerts.csv`)
+- New lemon / charcoal / lavender / amber look
