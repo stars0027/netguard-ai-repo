@@ -122,13 +122,32 @@
       const t0 = audioCtx.currentTime, tones = a.severity === 'critical' ? [880, 660, 880, 660] : [740, 740];
       tones.forEach((f, i) => { const o = audioCtx.createOscillator(), g = audioCtx.createGain(); o.type = 'square'; o.frequency.value = f; g.gain.setValueAtTime(0.0001, t0 + i * 0.18); g.gain.exponentialRampToValueAtTime(0.12, t0 + i * 0.18 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.18 + 0.16); o.connect(g); g.connect(audioCtx.destination); o.start(t0 + i * 0.18); o.stop(t0 + i * 0.18 + 0.17); });
     } catch { /* audio not available */ }
-    try { if (a.title && 'speechSynthesis' in window) { const u = new SpeechSynthesisUtterance((a.severity === 'critical' ? 'Critical alert. ' : 'Warning. ') + a.title.replace(/[^\w .,:-]/g, ' ').slice(0, 120)); u.rate = 1.05; u.volume = 0.8; speechSynthesis.speak(u); } } catch { /* ignore */ }
+    speakAlert(a);
     try { if (document.hidden && 'Notification' in window && Notification.permission === 'granted') new Notification('NetGuard AI: ' + a.title, { body: a.action || a.severity }); } catch { /* ignore */ }
+  }
+  // spoken alerts in English and Tamil (uses the voices installed on the device; Tamil needs a Tamil voice)
+  const TA_ALERT = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல்', conn_flood: 'இணைப்பு வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', canary: 'கேனரி பொறி திறக்கப்பட்டது' };
+  const voiceMode = () => { try { return localStorage.getItem('ng_voice') || 'both'; } catch { return 'both'; } };
+  function sayLine(text, lang) {
+    const u = new SpeechSynthesisUtterance(text); u.lang = lang; u.rate = 1; u.volume = 0.9;
+    const v = speechSynthesis.getVoices().find((x) => x.lang && x.lang.toLowerCase().startsWith(lang.slice(0, 2).toLowerCase())); if (v) u.voice = v;
+    speechSynthesis.speak(u);
+  }
+  function speakAlert(a) {
+    try {
+      if (!('speechSynthesis' in window) || !a.type) return;
+      const m = voiceMode(), blocked = /^Blocked/.test(a.action || '');
+      const en = (a.severity === 'critical' ? 'Critical alert. ' : 'Warning. ') + typeLabel(a.type) + ' detected' + (a.src_ip ? ' from ' + a.src_ip.split('').join(' ').replace(/ \. /g, ' dot ') : '') + '.' + (blocked ? ' Attacker blocked.' : '');
+      const ta = (a.severity === 'critical' ? 'முக்கிய எச்சரிக்கை. ' : 'எச்சரிக்கை. ') + (TA_ALERT[a.type] || typeLabel(a.type)) + ' கண்டறியப்பட்டது.' + (a.src_ip ? ' ' + a.src_ip + ' இலிருந்து.' : '') + (blocked ? ' தாக்குபவர் தடுக்கப்பட்டார்.' : '');
+      speechSynthesis.cancel();
+      if (m === 'both' || m === 'en') sayLine(en, 'en-IN');
+      if (m === 'both' || m === 'ta') sayLine(ta, 'ta-IN');
+    } catch { /* ignore */ }
   }
   function toggleSound(btn) {
     const on = !soundOn();
     try { localStorage.setItem('ng_sound', on ? '1' : '0'); } catch { /* ignore */ }
-    if (on) { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch { /* ignore */ } alarmSound({ severity: 'high' }); }
+    if (on) { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch { /* ignore */ } alarmSound({ severity: 'high', type: 'port_scan', src_ip: '203.0.113.5', action: 'Blocked' }); }
     btn.textContent = on ? 'Sound on' : 'Sound off'; btn.setAttribute('aria-pressed', String(on));
   }
   function updateNavBadge() { const b = document.getElementById('navBadge'); if (b) { const n = S.alerts.filter((a) => a.status === 'open').length; b.textContent = n > 99 ? '99+' : n; b.hidden = !n; } }
@@ -182,7 +201,7 @@
   }
 
   // ------------------------------------------------------------------ shell
-  const demoOn = () => { try { return localStorage.getItem('ng_demo') === '1'; } catch { return false; } };
+  const demoOn = () => false; // demo tools removed: NetGuard shows real data only
   const navItems = () => [['dashboard', 'Dashboard'], ['copilot', 'Copilot'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], ['tools', 'Tools'], ['warroom', 'War Room'], ['report', 'Report'], demoOn() ? ['simulator', 'Demo'] : null, ['settings', 'Settings']].filter(Boolean);
   function shell(view, active) {
     const badge = el('span', { class: 'badge', id: 'navBadge', hidden: true });
@@ -534,8 +553,6 @@
     current = { refresh: null, tick: null };
     return el('section', { class: 'view grid' },
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Detection & response')), f),
-      el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Demo tools')),
-        el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: demoOn(), onchange: (e) => { try { localStorage.setItem('ng_demo', e.target.checked ? '1' : '0'); } catch { /* ignore */ } loadDevices().then(route); } }), 'Show the attack simulator (for presentations only)')),
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Account · ' + S.me.email)), pwForm));
   }
 
@@ -564,6 +581,7 @@
       ...navItems().map(([k, l]) => ({ t: 'Go to ' + l, run: go('#/' + k) })),
       ...Object.keys(THEMES).map((k) => ({ t: 'Theme: ' + k[0].toUpperCase() + k.slice(1), run: () => { applyTheme(k); toast('Theme: ' + k); } })),
       { t: 'Turn lockdown mode on', run: () => setLockdown(true) }, { t: 'Turn lockdown mode off', run: () => setLockdown(false) },
+      ...[['both', 'English + தமிழ்'], ['en', 'English only'], ['ta', 'தமிழ் only']].map(([k, l]) => ({ t: 'Alert voice: ' + l, run: () => { try { localStorage.setItem('ng_voice', k); } catch { /* ignore */ } speakAlert({ severity: 'high', type: 'port_scan', src_ip: '203.0.113.5', action: 'Blocked' }); toast('Alert voice: ' + l); } })),
       { t: 'Toggle alarm sound', run: () => { try { localStorage.setItem('ng_sound', soundOn() ? '0' : '1'); } catch { /* ignore */ } toast('Sound ' + (soundOn() ? 'on' : 'off')); route(); } },
       { t: 'Print incident report', run: () => { location.hash = '#/report'; setTimeout(() => window.print(), 600); } },
       { t: 'Sign out', run: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } },
@@ -583,27 +601,64 @@
 
   // ------------------------------------------------------------------ copilot (rule-based assistant, answers from your own data)
   function copilotView() {
+    const getLang = () => { try { return localStorage.getItem('ng_lang') || 'auto'; } catch { return 'auto'; } };
+    const UI = {
+      en: { hello: 'Hi, I am NetGuard Copilot. I read your alerts, blocks and devices and explain them in plain words. I can also block an IP or turn on lockdown when you ask. I do not use any outside AI service, so your data stays on your server. Ask me in English or Tamil.', ph: 'Ask: "Am I safe?", "What is a port scan?", "block 203.0.113.5"…', ask: 'Ask', you: 'You', bot: 'NetGuard Copilot', label: 'Your question', chips: ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'What is a port scan?', 'How do I add a device?', 'lockdown on'], mic: 'Speak', read: 'Read answers aloud' },
+      ta: { hello: 'வணக்கம்! நான் NetGuard Copilot. உங்கள் அலெர்ட்கள், தடைகள், சாதனங்களை எளிய தமிழில் விளக்குவேன். நீங்கள் கேட்டால் ஒரு IP-ஐத் தடுக்கவும், lockdown-ஐ இயக்கவும் செய்வேன். வெளி AI சேவை எதுவும் பயன்படுத்தவில்லை, உங்கள் தரவு உங்கள் சர்வரிலேயே இருக்கும். தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.', ph: 'கேளுங்கள்: "நான் பாதுகாப்பாக இருக்கிறேனா?", "போர்ட் ஸ்கேன் என்றால் என்ன?"…', ask: 'கேள்', you: 'நீங்கள்', bot: 'NetGuard Copilot', label: 'உங்கள் கேள்வி', chips: ['நான் பாதுகாப்பாக இருக்கிறேனா?', 'இன்று என்ன நடந்தது?', 'என்னை யார் தாக்குகிறார்கள்?', 'நான் என்ன செய்ய வேண்டும்?', 'போர்ட் ஸ்கேன் என்றால் என்ன?', 'சாதனத்தை எப்படிச் சேர்ப்பது?', 'lockdown on'], mic: 'பேசு', read: 'பதில்களை உரக்கப் படி' },
+    };
+    const ui = () => UI[getLang() === 'ta' ? 'ta' : 'en'];
     const log = el('div', { class: 'chat', 'aria-live': 'polite' });
-    const input = el('input', { type: 'text', maxlength: 300, placeholder: 'Ask: "Am I safe?", "Who is attacking me?", or paste an IP…', 'aria-label': 'Ask Copilot' });
-    const add = (who, text, links) => {
-      const bubble = el('div', { class: 'msg ' + who }, el('span', { class: 'who' }, who === 'me' ? 'You' : 'NetGuard Copilot'), el('p', {}, ''));
+    const input = el('input', { type: 'text', maxlength: 300, 'aria-label': 'Ask Copilot' });
+    const chipsBox = el('div', { class: 'chips' }), askBtn = el('button', { class: 'btn primary', type: 'submit' }), labelTxt = el('span', {});
+    let readAloud = false;
+    const speak = (text, lang) => { try { if (!readAloud || !('speechSynthesis' in window)) return; speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = lang === 'ta' ? 'ta-IN' : 'en-IN'; speechSynthesis.speak(u); } catch { /* ignore */ } };
+    const runAction = async (ac, btn) => {
+      btn.disabled = true;
+      try {
+        if (ac.kind === 'block') { await api('POST', '/api/blocks', { ip: ac.ip, reason: 'Blocked from Copilot' }); toast('Blocked ' + ac.ip); }
+        else if (ac.kind === 'trust') { await api('POST', '/api/allowlist', { ip: ac.ip, note: 'Added from Copilot' }); toast('Trusted ' + ac.ip); }
+        else if (ac.kind === 'lockdown') { await setLockdown(ac.on); }
+        btn.textContent = '✓ ' + btn.textContent; loadInsights();
+      } catch (e) { toast(e.message, true); btn.disabled = false; }
+    };
+    const add = (who, text, extra = {}) => {
+      const u = ui(), bubble = el('div', { class: 'msg ' + who }, el('span', { class: 'who' }, who === 'me' ? u.you : u.bot), el('p', {}, ''));
       log.append(bubble); log.scrollTop = log.scrollHeight;
       const p = bubble.querySelector('p');
       if (who === 'me') { p.textContent = text; return; }
       let i = 0; const step = Math.max(1, Math.round(text.length / 70));
-      const iv = setInterval(() => { i += step; p.textContent = text.slice(0, i); log.scrollTop = log.scrollHeight; if (i >= text.length) { clearInterval(iv); (links || []).forEach((l) => bubble.append(el('a', { class: 'btn sm', href: l.href, style: 'text-decoration:none;display:inline-flex;margin:8px 8px 0 0' }, l.label))); } }, 18);
+      const iv = setInterval(() => {
+        i += step; p.textContent = text.slice(0, i); log.scrollTop = log.scrollHeight;
+        if (i >= text.length) {
+          clearInterval(iv); speak(text, extra.lang);
+          (extra.actions || []).forEach((ac) => { const b = el('button', { class: 'btn sm ' + (ac.kind === 'block' || (ac.kind === 'lockdown' && ac.on) ? 'danger' : ''), type: 'button', style: 'margin:8px 8px 0 0' }, ac.label); b.onclick = () => runAction(ac, b); bubble.append(b); });
+          (extra.links || []).forEach((l) => bubble.append(el('a', { class: 'btn sm', href: l.href, style: 'text-decoration:none;display:inline-flex;margin:8px 8px 0 0' }, l.label)));
+          log.scrollTop = log.scrollHeight;
+        }
+      }, 18);
     };
     async function ask(q) {
       q = q.trim(); if (!q) return; add('me', q); input.value = '';
-      try { const r = await api('POST', '/api/copilot', { question: q }); add('bot', r.answer, r.links); } catch (e) { add('bot', 'Sorry, I could not answer: ' + e.message); }
+      try { const r = await api('POST', '/api/copilot', { question: q, lang: getLang() }); add('bot', r.answer, r); } catch (e) { add('bot', 'Sorry: ' + e.message); }
     }
-    const chips = ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'Which devices are online?'].map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q));
-    add('bot', 'Hi, I am NetGuard Copilot. I read your alerts, blocks and devices and explain them in plain words. I do not use any outside AI service, so your data never leaves your server.');
-    current = {};
+    function paintUi(first) {
+      const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label;
+      chipsBox.replaceChildren(...u.chips.map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
+      if (first) add('bot', u.hello, { lang: getLang() });
+    }
+    const langSel = el('select', { 'aria-label': 'Language', onchange: (e) => { try { localStorage.setItem('ng_lang', e.target.value); } catch { /* ignore */ } paintUi(false); } },
+      el('option', { value: 'auto' }, 'Auto'), el('option', { value: 'en' }, 'English'), el('option', { value: 'ta' }, 'தமிழ்'));
+    langSel.value = getLang();
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const mic = SR ? el('button', { class: 'btn', type: 'button', 'aria-label': 'Speak your question' }, '🎤') : null;
+    if (mic) mic.onclick = () => { try { const r = new SR(); r.lang = getLang() === 'ta' ? 'ta-IN' : getLang() === 'en' ? 'en-IN' : navigator.language || 'en-IN'; r.interimResults = false; mic.disabled = true; r.onresult = (e) => { ask(e.results[0][0].transcript); }; r.onend = () => { mic.disabled = false; }; r.onerror = () => { mic.disabled = false; toast('Could not hear you', true); }; r.start(); } catch { mic.disabled = false; } };
+    const readChk = el('input', { type: 'checkbox', onchange: (e) => { readAloud = e.target.checked; if (!readAloud && 'speechSynthesis' in window) speechSynthesis.cancel(); } });
+    current = { cleanup: () => { try { speechSynthesis.cancel(); } catch { /* ignore */ } } };
+    paintUi(true);
     return el('section', { class: 'view grid' }, el('div', { class: 'panel pad copilot' },
-      el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'online')),
-      log, el('div', { class: 'chips' }, chips),
-      el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); ask(input.value); } }, el('label', {}, 'Your question', input), el('button', { class: 'btn primary', type: 'submit' }, 'Ask'))));
+      el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, el('label', { class: 'check', style: 'margin-right:10px' }, readChk, ui().read), el('span', { style: 'margin-right:6px' }, 'Language'), langSel)),
+      log, chipsBox,
+      el('form', { class: 'inline', onsubmit: (e) => { e.preventDefault(); ask(input.value); } }, el('label', {}, labelTxt, input), mic, askBtn)));
   }
 
   // ------------------------------------------------------------------ tools: IP inspector + threat hunt
@@ -776,7 +831,7 @@
   }
 
   // ------------------------------------------------------------------ router
-  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, simulator: simulatorView, settings: settingsView };
+  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, settings: settingsView };
   function route() {
     if (current.cleanup) { current.cleanup(); }
     current = { refresh: null };
