@@ -107,7 +107,7 @@
     }
   }
   async function refreshStats() { try { S.stats = await api('GET', '/api/stats'); updateNavBadge(); if (current.tick) current.tick(); } catch { /* ignore */ } }
-  async function loadDevices() { S.devices = (await api('GET', '/api/devices')).filter((d) => !d.virtual || demoOn()); if (!S.sel || !S.devices.find((d) => d.id === S.sel)) S.sel = S.devices[0] && S.devices[0].id; }
+  async function loadDevices() { S.devices = (await api('GET', '/api/devices')); if (!S.sel || !S.devices.find((d) => d.id === S.sel)) S.sel = S.devices[0] && S.devices[0].id; }
   async function loadAlerts() { S.alerts = await api('GET', '/api/alerts?limit=200'); }
   async function loadInsights() { try { S.ins = await api('GET', '/api/insights'); if (current.insights) current.insights(); } catch { /* ignore */ } }
   const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
@@ -201,8 +201,7 @@
   }
 
   // ------------------------------------------------------------------ shell
-  const demoOn = () => false; // demo tools removed: NetGuard shows real data only
-  const navItems = () => [['dashboard', 'Dashboard'], ['copilot', 'Copilot'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], ['tools', 'Tools'], ['warroom', 'War Room'], ['report', 'Report'], demoOn() ? ['simulator', 'Demo'] : null, ['settings', 'Settings']].filter(Boolean);
+  const navItems = () => [['dashboard', 'Dashboard'], ['copilot', 'Copilot'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], ['tools', 'Tools'], ['warroom', 'War Room'], ['report', 'Report'], ['simulator', 'Demo'], ['settings', 'Settings']].filter(Boolean);
   function shell(view, active) {
     const badge = el('span', { class: 'badge', id: 'navBadge', hidden: true });
     return el('div', { class: 'wrap' },
@@ -413,12 +412,12 @@
       list.replaceChildren(...S.devices.map((d) => {
         const live = S.live[d.id] || {};
         return el('div', { class: 'devrow' },
-          el('div', {}, el('div', { class: 'n' }, el('i', { class: 'led ' + (d.status === 'online' ? 'on' : d.status === 'offline' ? 'off' : 'wait') }), d.name, d.virtual ? el('span', { class: 'pill' }, 'simulated') : null),
-            el('div', { class: 'muted mono' }, d.virtual ? 'Used by the Simulator' : `${d.hostname || 'waiting for agent'} · ${d.os || ''}`)),
+          el('div', {}, el('div', { class: 'n' }, el('i', { class: 'led ' + (d.status === 'online' ? 'on' : d.status === 'offline' ? 'off' : 'wait') }), d.name),
+            el('div', { class: 'muted mono' }, `${d.hostname || 'waiting for agent'} · ${d.os || ''}`)),
           el('div', {}, el('div', { class: 'k' }, 'Status'), d.status + (d.enforce ? ' · enforcing' : d.status === 'online' ? ' · monitor-only' : '')),
           el('div', {}, el('div', { class: 'k' }, 'Traffic'), live.pps != null ? live.pps.toLocaleString() + ' pkt/s' : '—'),
           el('div', {}, el('div', { class: 'k' }, 'Last seen'), ago(d.last_seen)),
-          el('div', { class: 'inline' }, d.virtual ? null : [
+          el('div', { class: 'inline' }, [
             el('button', { class: 'btn sm', onclick: async () => { if (!confirm('Rotate the API key? The agent stops working until you update it.')) return; const r = await api('POST', `/api/devices/${d.id}/rotate-key`, {}); keyArea.replaceChildren(installBox(r.api_key)); } }, 'New key'),
             el('button', { class: 'btn sm danger', onclick: async () => { if (!confirm(`Remove ${d.name}?`)) return; await api('DELETE', `/api/devices/${d.id}`); await loadDevices(); paint(); } }, 'Remove')]));
       }));
@@ -493,30 +492,6 @@
         el('div', { class: 'inline', style: 'margin-bottom:12px' }, el('label', {}, 'IP address', aip), el('label', {}, 'Note', anote),
           el('button', { class: 'btn', onclick: add('/api/allowlist', () => ({ ip: aip.value, note: anote.value }), [aip, anote]) }, 'Add to allowlist')),
         el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['IP', 'Note', ''].map((h) => el('th', {}, h)))), allowBody))));
-  }
-
-  // ------------------------------------------------------------------ simulator
-  function simulatorView() {
-    const status = el('p', { class: 'mono muted', 'aria-live': 'polite' }, 'No command sent yet.');
-    const fire = (type, label) => async () => {
-      try {
-        const r = await api('POST', '/api/sim/attack', { type });
-        status.textContent = `${fmtTime(Date.now())} ${label}${r.attacker_ip ? ' from ' + r.attacker_ip : ''}. ${r.listening} dashboard${r.listening === 1 ? '' : 's'} listening. Watch the Dashboard.`;
-        try { navigator.vibrate && navigator.vibrate(type === 'cyber' ? [60, 40, 60] : 140); } catch { /* ignore */ }
-      } catch (e) { toast(e.message, true); }
-    };
-    const btn = (cls, title, sub, type, label) => el('button', { class: 'big ' + cls, type: 'button', onclick: fire(type, label) }, el('span', { class: 'lbl' }, title), el('span', { class: 'sub' }, sub));
-    return el('section', { class: 'view grid' },
-      el('div', {}, el('h2', {}, 'Attack simulator'),
-        el('p', { class: 'muted', style: 'max-width:70ch;margin-top:6px' }, 'Sends synthetic traffic from a fake attacker into the demo device. It goes through the exact same detection engine, alerting and auto-block logic as a real agent. Open the Dashboard on another screen to watch, or use this page on your phone.')),
-      el('div', { class: 'remote' },
-        btn('red', 'Launch cyber attack', 'Floods the demo network with 2,000 packets per second', 'cyber', 'Flood attack launched'),
-        btn('amber', 'Inject physical spark', 'Electrical arc sensor event triggers an emergency shutdown', 'spark', 'Physical spark injected'),
-        btn('blue', 'Port scan', 'One host probes dozens of ports', 'scan', 'Port scan launched'),
-        btn('violet', 'Login brute force', 'Repeated failed logins from one address', 'brute', 'Brute force launched')),
-      el('div', { class: 'panel pad' }, status,
-        el('p', { class: 'muted', style: 'margin-top:8px' }, 'If auto-block is on (Settings), the attacker is blocked within seconds and the simulated attack stops, like it would on a real machine.'),
-        el('button', { class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await api('POST', '/api/sim/reset', {}); toast('Simulation stopped'); } }, 'Stop simulation')));
   }
 
   // ------------------------------------------------------------------ settings
@@ -601,7 +576,7 @@
 
   // ------------------------------------------------------------------ copilot (rule-based assistant, answers from your own data)
   function copilotView() {
-    const getLang = () => { try { return localStorage.getItem('ng_lang') || 'auto'; } catch { return 'auto'; } };
+    const getLang = () => { try { return localStorage.getItem('ng_lang') || 'both'; } catch { return 'auto'; } };
     const UI = {
       en: { hello: 'Hi, I am NetGuard Copilot. I read your alerts, blocks and devices and explain them in plain words. I can also block an IP or turn on lockdown when you ask. I do not use any outside AI service, so your data stays on your server. Ask me in English or Tamil.', ph: 'Ask: "Am I safe?", "What is a port scan?", "block 203.0.113.5"…', ask: 'Ask', you: 'You', bot: 'NetGuard Copilot', label: 'Your question', chips: ['Am I safe?', 'What happened today?', 'Who is attacking me?', 'What should I do?', 'What is a port scan?', 'How do I add a device?', 'lockdown on'], mic: 'Speak', read: 'Read answers aloud' },
       ta: { hello: 'வணக்கம்! நான் NetGuard Copilot. உங்கள் அலெர்ட்கள், தடைகள், சாதனங்களை எளிய தமிழில் விளக்குவேன். நீங்கள் கேட்டால் ஒரு IP-ஐத் தடுக்கவும், lockdown-ஐ இயக்கவும் செய்வேன். வெளி AI சேவை எதுவும் பயன்படுத்தவில்லை, உங்கள் தரவு உங்கள் சர்வரிலேயே இருக்கும். தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.', ph: 'கேளுங்கள்: "நான் பாதுகாப்பாக இருக்கிறேனா?", "போர்ட் ஸ்கேன் என்றால் என்ன?"…', ask: 'கேள்', you: 'நீங்கள்', bot: 'NetGuard Copilot', label: 'உங்கள் கேள்வி', chips: ['நான் பாதுகாப்பாக இருக்கிறேனா?', 'இன்று என்ன நடந்தது?', 'என்னை யார் தாக்குகிறார்கள்?', 'நான் என்ன செய்ய வேண்டும்?', 'போர்ட் ஸ்கேன் என்றால் என்ன?', 'சாதனத்தை எப்படிச் சேர்ப்பது?', 'lockdown on'], mic: 'பேசு', read: 'பதில்களை உரக்கப் படி' },
@@ -610,8 +585,8 @@
     const log = el('div', { class: 'chat', 'aria-live': 'polite' });
     const input = el('input', { type: 'text', maxlength: 300, 'aria-label': 'Ask Copilot' });
     const chipsBox = el('div', { class: 'chips' }), askBtn = el('button', { class: 'btn primary', type: 'submit' }), labelTxt = el('span', {});
-    let readAloud = false;
-    const speak = (text, lang) => { try { if (!readAloud || !('speechSynthesis' in window)) return; speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = lang === 'ta' ? 'ta-IN' : 'en-IN'; speechSynthesis.speak(u); } catch { /* ignore */ } };
+    let readAloud = true;
+    const speak = (text, lang) => { try { if (!readAloud || !('speechSynthesis' in window)) return; speechSynthesis.cancel(); const parts = lang === 'both' ? text.split('\n\n') : [text]; parts.forEach((t, i) => { const l = lang === 'both' ? (i === 0 ? 'en' : 'ta') : lang; const u = new SpeechSynthesisUtterance(t); u.lang = l === 'ta' ? 'ta-IN' : 'en-IN'; const v = speechSynthesis.getVoices().find((x) => x.lang && x.lang.toLowerCase().startsWith(l)); if (v) u.voice = v; speechSynthesis.speak(u); }); } catch { /* ignore */ } };
     const runAction = async (ac, btn) => {
       btn.disabled = true;
       try {
@@ -643,16 +618,16 @@
     }
     function paintUi(first) {
       const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label;
-      chipsBox.replaceChildren(...u.chips.map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
-      if (first) add('bot', u.hello, { lang: getLang() });
+      chipsBox.replaceChildren(...(getLang() === 'both' ? [...UI.en.chips, ...UI.ta.chips.slice(0, 6)] : u.chips).map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
+      if (first) add('bot', getLang() === 'both' ? UI.en.hello + '\n\n' + UI.ta.hello : u.hello, { lang: getLang() });
     }
     const langSel = el('select', { 'aria-label': 'Language', onchange: (e) => { try { localStorage.setItem('ng_lang', e.target.value); } catch { /* ignore */ } paintUi(false); } },
-      el('option', { value: 'auto' }, 'Auto'), el('option', { value: 'en' }, 'English'), el('option', { value: 'ta' }, 'தமிழ்'));
+      el('option', { value: 'both' }, 'English + தமிழ்'), el('option', { value: 'auto' }, 'Auto'), el('option', { value: 'en' }, 'English'), el('option', { value: 'ta' }, 'தமிழ்'));
     langSel.value = getLang();
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const mic = SR ? el('button', { class: 'btn', type: 'button', 'aria-label': 'Speak your question' }, '🎤') : null;
     if (mic) mic.onclick = () => { try { const r = new SR(); r.lang = getLang() === 'ta' ? 'ta-IN' : getLang() === 'en' ? 'en-IN' : navigator.language || 'en-IN'; r.interimResults = false; mic.disabled = true; r.onresult = (e) => { ask(e.results[0][0].transcript); }; r.onend = () => { mic.disabled = false; }; r.onerror = () => { mic.disabled = false; toast('Could not hear you', true); }; r.start(); } catch { mic.disabled = false; } };
-    const readChk = el('input', { type: 'checkbox', onchange: (e) => { readAloud = e.target.checked; if (!readAloud && 'speechSynthesis' in window) speechSynthesis.cancel(); } });
+    const readChk = el('input', { type: 'checkbox', checked: true, onchange: (e) => { readAloud = e.target.checked; if (!readAloud && 'speechSynthesis' in window) speechSynthesis.cancel(); } });
     current = { cleanup: () => { try { speechSynthesis.cancel(); } catch { /* ignore */ } } };
     paintUi(true);
     return el('section', { class: 'view grid' }, el('div', { class: 'panel pad copilot' },
@@ -830,8 +805,32 @@
         el('div', {}, el('h3', { class: 'sub' }, 'Base64 and JWT decoder'), el('label', {}, 'Input', din), dout)));
   }
 
+  // ------------------------------------------------------------------ simulator
+  function simulatorView() {
+    const status = el('p', { class: 'mono muted', 'aria-live': 'polite' }, 'No command sent yet.');
+    const fire = (type, label) => async () => {
+      try {
+        const r = await api('POST', '/api/sim/attack', { type });
+        status.textContent = `${fmtTime(Date.now())} ${label}${r.attacker_ip ? ' from ' + r.attacker_ip : ''}. ${r.listening} dashboard${r.listening === 1 ? '' : 's'} listening. Watch the Dashboard.`;
+        try { navigator.vibrate && navigator.vibrate(type === 'cyber' ? [60, 40, 60] : 140); } catch { /* ignore */ }
+      } catch (e) { toast(e.message, true); }
+    };
+    const btn = (cls, title, sub, type, label) => el('button', { class: 'big ' + cls, type: 'button', onclick: fire(type, label) }, el('span', { class: 'lbl' }, title), el('span', { class: 'sub' }, sub));
+    return el('section', { class: 'view grid' },
+      el('div', {}, el('h2', {}, 'Attack simulator'),
+        el('p', { class: 'muted', style: 'max-width:70ch;margin-top:6px' }, 'Sends synthetic traffic from a fake attacker into the demo device. It goes through the exact same detection engine, alerting and auto-block logic as a real agent. Open the Dashboard on another screen to watch, or use this page on your phone.')),
+      el('div', { class: 'remote' },
+        btn('red', 'Launch cyber attack', 'Floods the demo network with 2,000 packets per second', 'cyber', 'Flood attack launched'),
+        btn('amber', 'Inject physical spark', 'Electrical arc sensor event triggers an emergency shutdown', 'spark', 'Physical spark injected'),
+        btn('blue', 'Port scan', 'One host probes dozens of ports', 'scan', 'Port scan launched'),
+        btn('violet', 'Login brute force', 'Repeated failed logins from one address', 'brute', 'Brute force launched')),
+      el('div', { class: 'panel pad' }, status,
+        el('p', { class: 'muted', style: 'margin-top:8px' }, 'If auto-block is on (Settings), the attacker is blocked within seconds and the simulated attack stops, like it would on a real machine.'),
+        el('button', { class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await api('POST', '/api/sim/reset', {}); toast('Simulation stopped'); } }, 'Stop simulation')));
+  }
+
   // ------------------------------------------------------------------ router
-  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, settings: settingsView };
+  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, simulator: simulatorView, settings: settingsView };
   function route() {
     if (current.cleanup) { current.cleanup(); }
     current = { refresh: null };

@@ -92,7 +92,7 @@ pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 var(--mon
 code,.code{font-family:var(--mono);font-size:12px;background:#151515;border:1px solid var(--line);border-radius:4px;padding:1px 6px}
 .codeblock{background:#151515;border:1px solid var(--line2);border-radius:6px;padding:12px;font:12px/1.6 var(--mono);overflow-x:auto;white-space:pre;user-select:all}
 .keybox{border:1px solid var(--amb);border-radius:10px;padding:14px 16px;background:rgba(200,121,44,.08);display:grid;gap:10px}
-/* simulator */
+/* panels */
 .remote{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .big{appearance:none;border:0;cursor:pointer;border-radius:14px;text-align:center;min-height:clamp(150px,26vh,260px);padding:22px 16px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;touch-action:manipulation;transition:transform .08s,filter .15s}
 .big:active{transform:scale(.975);filter:brightness(1.15)}
@@ -193,3 +193,10 @@ code,.code{font-family:var(--mono);font-size:12px;background:#151515;border:1px 
 .toolkit{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}.toolkit label{margin-bottom:8px}
 .meter{height:10px;border-radius:6px;background:rgba(255,255,255,.08);overflow:hidden;margin:10px 0}.meter i{display:block;height:100%;width:0;transition:width .3s,background .3s}
 @media(max-width:1000px){.toolkit{grid-template-columns:minmax(0,1fr)}}
+/* Tamil and other complex scripts: no letter-spacing/uppercase, and a font stack with real Tamil fonts */
+.copilot,.copilot *{font-family:"Nirmala UI","Noto Sans Tamil","Latha","Segoe UI",system-ui,sans-serif}
+.copilot .meta,.copilot .btn,.copilot .chip,.copilot label,.copilot .who,.copilot .head h2{letter-spacing:0;text-transform:none}
+.copilot .head h2{font-size:16px}
+.copilot .msg p{line-height:1.6}
+
+.copilot .msg p{white-space:pre-line}

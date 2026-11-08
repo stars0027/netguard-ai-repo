@@ -95,7 +95,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const inst = await fetch(base + '/install.sh').then((r) => r.text());
   ok(inst.startsWith('#!/usr/bin/env bash') && inst.includes('SERVER="http://127.0.0.1'), 'one-command installer is served');
-  console.log('simulator');
+  console.log('live stream');
   const login = await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'correct horse 9' });
   ok(login.status === 200, 'login works');
   await call('PUT', '/api/settings', { auto_block: true }); // was switched off in the management test
@@ -105,15 +105,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const req = http.get(base + '/api/stream', { headers: { Cookie: cookie } }, (res) => {
       res.on('data', (c) => { for (const m of String(c).matchAll(/event: (\w+)/g)) events.push(m[1]); });
       setTimeout(async () => {
-        await call('POST', '/api/sim/attack', { type: 'cyber' });
-        setTimeout(() => { req.destroy(); resolve(events); }, 4500);
-      }, 2500);
+        await tel({ pps: 120 });
+        await tel({ pps: 6000, sources: [{ ip: '198.51.100.201', pkts: 5800, syns: 5000, ports: [80] }] });
+        setTimeout(() => { req.destroy(); resolve(events); }, 1500);
+      }, 800);
     });
   });
   ok(stream.includes('telemetry'), 'SSE streams live telemetry');
-  ok(stream.includes('alert') && stream.includes('block'), 'simulated attack -> alert + block pushed live');
-  const simAlerts = (await call('GET', '/api/alerts')).data;
-  ok(simAlerts.some((a) => a.type === 'flood' && /^Blocked/.test(a.action)), 'simulator attack was auto-blocked');
+  ok(stream.includes('alert') && stream.includes('block'), 'real attack -> alert + block pushed live');
+  ok((await call('GET', '/api/alerts')).data.some((a) => a.src_ip === '198.51.100.201' && /^Blocked/.test(a.action)), 'attack was auto-blocked');
+  const simRes = await call('POST', '/api/sim/attack', { type: 'cyber' });
+  ok(simRes.status === 200 && simRes.data.attacker_ip, 'demo attack button starts a simulated attack');
+  await sleep(3500);
+  ok((await call('GET', '/api/alerts')).data.some((a) => a.device_name && /Demo/.test(a.device_name) && /^Blocked/.test(a.action || '')), 'demo attack is detected and auto-blocked by the real engine');
+  const cpBoth = (await call('POST', '/api/copilot', { question: 'am i safe', lang: 'both' })).data;
+  ok(/[\u0B80-\u0BFF]/.test(cpBoth.answer) && /security|score|devices/i.test(cpBoth.answer), 'copilot can answer in English and Tamil together');
 
   console.log('insights + export');
   const ins = (await call('GET', '/api/insights')).data;
@@ -144,6 +150,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ok(tAlerts.some((x) => x.type === 'canary' && x.severity === 'critical'), 'opening the trap raises a critical alert');
   ok((await call('GET', '/api/canaries')).data[0].hits === 1, 'trap counts its hits');
   ok((await fetch(base + '/c/doesnotexist')).status === 404, 'unknown trap tokens are harmless');
+
+  console.log('copilot Tamil + actions');
+  const cpT = (q, lang) => call('POST', '/api/copilot', { question: q, lang }).then((r) => r.data);
+  ok(/[\u0B80-\u0BFF]/.test((await cpT('நான் பாதுகாப்பாக இருக்கிறேனா?')).answer), 'Tamil question gets a Tamil answer');
+  ok(/[\u0B80-\u0BFF]/.test((await cpT('what is a port scan', 'ta')).answer), 'language switch forces Tamil');
+  ok(!/[\u0B80-\u0BFF]/.test((await cpT('what is a port scan', 'en')).answer), 'English stays English');
+  const blk = await cpT('block 198.51.100.77');
+  ok(blk.actions.length === 1 && blk.actions[0].kind === 'block' && blk.actions[0].ip === '198.51.100.77', 'block command proposes a confirm button (does not block by itself)');
+  ok(!(await call('GET', '/api/blocks')).data.blocks.some((x) => x.ip === '198.51.100.77'), 'copilot never blocks without a click');
+  ok((await cpT('lockdown on')).actions[0].kind === 'lockdown', 'lockdown command works');
+  ok((await cpT('how do I add a device?')).kind === 'howto', 'how-to question answered');
+  ok((await cpT('பாதுகாப்பு பற்றி ஒரு IP 203.0.113.9 சரிபார்')).kind === 'ip', 'Tamil sentence with an IP is inspected');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();

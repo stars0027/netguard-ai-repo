@@ -324,42 +324,126 @@ route('GET', '/api/hunt', 'user', async (req, res, ctx) => {
   send(res, 200, { alerts, logs });
 });
 
-// A rule-based security assistant. It answers only from this user's own data (no outside AI service).
-route('POST', '/api/copilot', 'user', async (req, res, ctx) => {
-  if (!auth.rateLimit('cop:' + ctx.user.id, 60, 60000)) throw bad('Slow down', 429);
-  const u = ctx.user.id, q = String(ctx.body.question || '').toLowerCase().slice(0, 300), I = insightsFor(u);
-  const links = [];
-  let ans;
-  const ipm = q.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+// Bilingual (English + Tamil) rule-based security assistant. It answers only from this user's own data
+// (no outside AI service). It can also propose actions (block, trust, lockdown) that the user confirms with one click.
+const TA_TYPE = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல் (brute force)', conn_flood: 'இணைப்பு வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', canary: 'கேனரி பொறி' };
+const TA_FIX = {
+  'Review and resolve them on the Alerts page': 'Alerts பக்கத்தில் அவற்றைப் பார்த்து தீர்க்கவும்',
+  'Acknowledge or resolve them on the Alerts page': 'Alerts பக்கத்தில் அவற்றை ஏற்கவும் அல்லது தீர்க்கவும்',
+  'Acknowledge or resolve them': 'அவற்றை ஏற்கவும் அல்லது தீர்க்கவும்',
+  'Turn on "Block attackers automatically" in Settings': 'Settings-இல் தாக்குபவர்களைத் தானாகத் தடுக்கும் வசதியை இயக்கவும்',
+  'Check that the agent is still running on them': 'அவற்றில் agent இன்னும் இயங்குகிறதா எனச் சரிபார்க்கவும்',
+  'Restart the agent with --enforce so it can block': 'agent-ஐ --enforce உடன் மீண்டும் தொடங்கவும், அப்போது அது தடுக்க முடியும்',
+  'Add a Slack or Discord webhook in Settings': 'Settings-இல் Slack அல்லது Discord webhook-ஐச் சேர்க்கவும்',
+};
+const EXPLAIN = {
+  port_scan: { en: 'A port scan is one address knocking on many doors (ports) on your machine to find a weak one. It usually happens right before an attack. NetGuard spots it and blocks that address.', ta: 'போர்ட் ஸ்கேன் என்பது ஒரே IP உங்கள் கணினியின் பல போர்ட்களைச் சோதித்து பலவீனமான கதவைத் தேடுவது. இது பொதுவாக தாக்குதலுக்கு முன் நடக்கும். NetGuard இதைக் கண்டுபிடித்து அந்த IP-ஐத் தடுக்கும்.' },
+  brute_force: { en: 'Brute force means guessing a password again and again until it works. If one address fails to log in many times within a minute, NetGuard blocks it. Use long passwords to stay safe.', ta: 'Brute force என்பது கடவுச்சொல்லை மீண்டும் மீண்டும் ஊகித்து உள்நுழைய முயல்வது. ஒரே IP ஒரு நிமிடத்தில் பலமுறை தோற்றால் NetGuard அதைத் தடுக்கும். நீண்ட கடவுச்சொற்களைப் பயன்படுத்துங்கள்.' },
+  flood: { en: 'A flood sends a huge number of packets at once to overload a server. NetGuard learns what normal traffic looks like for each device, and blocks the address that goes far above it.', ta: 'Flood என்பது ஒரே நேரத்தில் ஏராளமான பாக்கெட்டுகளை அனுப்பி சர்வரை முடக்க முயல்வது. NetGuard ஒவ்வொரு சாதனத்தின் சாதாரண போக்குவரத்தைக் கற்றுக்கொண்டு, அதை மீறும் IP-ஐத் தடுக்கும்.' },
+  canary: { en: 'A canary trap is a link no real person should ever open. If someone opens it, NetGuard raises a critical alert and blocks them. Create one on the Tools page.', ta: 'கேனரி பொறி என்பது உண்மையான யாரும் திறக்கக் கூடாத ஒரு இணைப்பு. யாராவது திறந்தால் உடனே முக்கிய அலெர்ட் வந்து அவர் IP தடுக்கப்படும். Tools பக்கத்தில் ஒன்றை உருவாக்கலாம்.' },
+  exposed: { en: 'Services like Telnet, Remote Desktop or Redis open to the whole internet are easy targets. Close them or limit them with a firewall.', ta: 'Telnet, Remote Desktop, Redis போன்ற சேவைகள் இணையம் முழுவதற்கும் திறந்திருந்தால் ஹேக்கர்கள் எளிதில் நுழையலாம். அவற்றை மூடவும் அல்லது firewall மூலம் கட்டுப்படுத்தவும்.' },
+  lockdown: { en: 'Lockdown mode sets maximum sensitivity and automatic blocking. Turn it on during an attack. You can say "lockdown on" and I will do it for you.', ta: 'Lockdown என்பது அதிகபட்ச உணர்திறனும் தானியங்கித் தடையும். தாக்குதல் நேரத்தில் இதை இயக்குங்கள். "lockdown on" எனச் சொன்னால் நான் செய்து தருவேன்.' },
+  score: { en: 'The security score (0 to 100) starts at 100 and drops for real problems such as open critical alerts, automatic blocking being off, or offline devices. Fix the listed items to raise it.', ta: 'பாதுகாப்பு மதிப்பெண் (0 முதல் 100) 100-இல் தொடங்கி, திறந்த முக்கிய அலெர்ட்கள், தானியங்கித் தடை அணைந்திருப்பது, ஆஃப்லைன் சாதனங்கள் போன்ற உண்மையான சிக்கல்களுக்கு குறையும். பட்டியலிடப்பட்டவற்றைச் சரிசெய்தால் உயரும்.' },
+};
+function copilotAnswer(u, rawQ, lang) {
+  const q = String(rawQ || '').toLowerCase().slice(0, 300);
+  const tamilScript = /[஀-௿]/.test(q), tanglish = /\b(enna|yaar|epdi|eppadi|nadanthuchu|nadandhathu|paadhukaapu|pathukappu|thadu|vanakkam|nandri)\b/.test(q);
+  const ta = lang === 'ta' || (lang !== 'en' && (tamilScript || tanglish));
+  const L = (en, tamil) => (ta ? tamil : en);
+  const I = insightsFor(u), links = [], actions = [];
+  const tName = (t) => (ta ? (TA_TYPE[t] || lab(t)) : lab(t));
+  const agoL = (ts) => { if (!ta) return ago(ts); const m = Math.round((now() - ts) / 60000); return m < 1 ? 'இப்போதுதான்' : m < 90 ? m + ' நிமிடங்களுக்கு முன்' : m < 2880 ? Math.round(m / 60) + ' மணி நேரத்துக்கு முன்' : Math.round(m / 1440) + ' நாட்களுக்கு முன்'; };
+  const fixL = (f) => (ta ? (TA_FIX[f] || f) : f);
   const total24 = I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0);
   const devs = db.prepare('SELECT name,status,enforce FROM devices WHERE user_id=? AND virtual=0').all(u);
-  if (ipm && cleanIp(ipm[0])) {
-    const r = ipReport(u, cleanIp(ipm[0]));
-    ans = `${r.ip}: ${r.verdict}` + (r.last_seen ? ` Last seen ${ago(r.last_seen)}.` : '');
-    if (!r.blocked && !r.allowlisted && !r.protected && r.alerts.length) links.push({ label: 'Open in IP Inspector', href: '#/tools?ip=' + r.ip });
-  } else if (/safe|score|secur|protect|risk/.test(q)) {
-    ans = I.score == null ? 'You have no real devices yet, so there is nothing to score. Add a device on the Devices page.' : `Your security score is ${I.score}/100 (${I.score >= 85 ? 'well protected' : I.score >= 60 ? 'needs attention' : 'at risk'}).` + (I.factors.length ? ' To raise it: ' + I.factors.map((f) => `${f.fix.toLowerCase()} (+${f.points})`).join('; ') + '.' : ' Nothing needs fixing.');
-  } else if (/who|attack|top|hacker|ip/.test(q) && !/how|what should/.test(q)) {
-    ans = I.attackers.length ? 'Top attackers this week: ' + I.attackers.slice(0, 4).map((a) => `${a.ip} (${a.types.map(lab).join(', ')}, ${a.blocked ? 'blocked' : 'NOT blocked'})`).join('; ') + '.' : 'No attackers seen in the last 7 days.';
-    if (I.attackers.some((a) => !a.blocked)) links.push({ label: 'Block them on the dashboard', href: '#/dashboard' });
-  } else if (/do|fix|improve|recommend|advice|should|next|help me/.test(q)) {
-    ans = I.factors.length ? 'My recommendations, most important first: ' + I.factors.sort((a, b) => b.points - a.points).map((f, i) => `${i + 1}. ${f.fix}`).join(' ') : 'Everything looks healthy. Keep your agents updated and review alerts weekly.';
-    links.push({ label: 'Open Settings', href: '#/settings' });
-  } else if (/block/.test(q)) {
-    const n = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1').get(u).c;
-    ans = `${n} address(es) are blocked right now. Automatic blocking is ${I.auto_block ? 'on' : 'OFF'}.`; links.push({ label: 'Open Blocklist', href: '#/blocks' });
-  } else if (/device|agent|online|offline|server/.test(q)) {
-    ans = devs.length ? devs.map((d) => `${d.name}: ${d.status}${d.status === 'online' ? (d.enforce ? ', enforcing' : ', monitor-only') : ''}`).join('. ') + '.' : 'No devices yet.';
-    links.push({ label: 'Open Devices', href: '#/devices' });
-  } else if (/today|happen|summary|status|report|24|hour|overview|going on/.test(q)) {
-    const worst = I.by_type[0];
-    ans = total24 ? `In the last 24 hours NetGuard raised ${total24} alert(s)` + (worst ? `, mostly ${lab(worst.type)}` : '') + `. ${I.attackers.filter((a) => a.blocked).length} attacker(s) are blocked. Security score: ${I.score == null ? 'n/a' : I.score + '/100'}.` : 'Quiet day: no alerts in the last 24 hours.';
-    links.push({ label: 'Open full incident report', href: '#/report' });
-  } else {
-    ans = 'I can answer from your own data. Try: "Am I safe?", "What happened today?", "Who is attacking me?", "What should I do?", "Which devices are online?", or paste an IP address to check it.';
+  const has = (re) => re.test(q);
+  const ipm = q.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/), ip = ipm && cleanIp(ipm[0]);
+  let ans, kind = 'help';
+
+  if (has(/^(hi|hello|hey|vanakkam)\b|வணக்கம்|ஹாய்/)) { kind = 'greet'; ans = L('Hello! I am NetGuard Copilot. Ask me about your security in plain words, in English or Tamil.', 'வணக்கம்! நான் NetGuard Copilot. உங்கள் பாதுகாப்பைப் பற்றி எளிய தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.'); }
+  else if (has(/thank|நன்றி|nandri/)) { kind = 'thanks'; ans = L('You are welcome! Stay safe.', 'நன்றி! பாதுகாப்பாக இருங்கள்.'); }
+  else if (has(/lockdown|லாக்டவுன்/)) {
+    const off = has(/\boff\b|disable|stop|அணை|நிறுத்து/);
+    if (has(/\bon\b|enable|start|activate|turn|இயக்கு|போடு|செய்/) || off) { kind = 'lockdown'; actions.push({ kind: 'lockdown', on: !off, label: off ? L('Turn lockdown OFF', 'Lockdown-ஐ அணை') : L('Turn lockdown ON', 'Lockdown-ஐ இயக்கு') }); ans = off ? L('I can turn lockdown off and restore your old sensitivity. Press the button to confirm.', 'Lockdown-ஐ அணைத்து பழைய உணர்திறனை மீட்டெடுக்கலாம். உறுதிப்படுத்த பொத்தானை அழுத்துங்கள்.') : L('Lockdown sets maximum sensitivity and automatic blocking. Press the button to confirm.', 'Lockdown அதிகபட்ச உணர்திறனையும் தானியங்கித் தடையையும் இயக்கும். உறுதிப்படுத்த பொத்தானை அழுத்துங்கள்.'); }
+    else { kind = 'explain'; ans = EXPLAIN.lockdown[ta ? 'ta' : 'en']; }
   }
-  send(res, 200, { answer: ans, links });
+  else if (ip && has(/\b(unblock|allow|trust)\b|அனுமதி|நம்பு/)) { kind = 'trust'; actions.push({ kind: 'trust', ip, label: L('Trust ' + ip, ip + '-ஐ நம்பு') }); ans = L(`I can add ${ip} to your allowlist so it is never blocked. Press the button to confirm.`, `${ip}-ஐ allowlist-இல் சேர்க்கலாம், அப்போது அது தடுக்கப்படாது. உறுதிப்படுத்த பொத்தானை அழுத்துங்கள்.`); }
+  else if (ip && has(/\bblock\b|ban|தடு|தடை/)) { kind = 'block'; actions.push({ kind: 'block', ip, label: L('Block ' + ip, ip + '-ஐத் தடு') }); ans = L(`I can block ${ip} on all your devices. Press the button to confirm.`, `${ip}-ஐ உங்கள் எல்லா சாதனங்களிலும் தடுக்கலாம். உறுதிப்படுத்த பொத்தானை அழுத்துங்கள்.`); }
+  else if (ip) {
+    kind = 'ip'; const r = ipReport(u, ip);
+    const v = r.allowlisted ? L('Trusted: on your allowlist.', 'நம்பகமானது: உங்கள் allowlist-இல் உள்ளது.') : r.protected ? L('Protected: ' + r.protected + '.', 'பாதுகாக்கப்பட்டது: ' + r.protected + '.') : r.blocked ? L('Dangerous: currently blocked.', 'ஆபத்தானது: தற்போது தடுக்கப்பட்டுள்ளது.') : r.alerts.length ? L(`Suspicious: caused ${r.alerts.length} alert(s) (${[...new Set(r.alerts.map((a) => a.type))].map(tName).join(', ')}).`, `சந்தேகத்திற்குரியது: ${r.alerts.length} அலெர்ட்களை ஏற்படுத்தியது (${[...new Set(r.alerts.map((a) => a.type))].map(tName).join(', ')}).`) : L('Unknown: NetGuard has never seen this address.', 'தெரியாதது: NetGuard இந்த முகவரியை இதுவரை பார்த்ததில்லை.');
+    ans = `${r.ip}: ${v}` + (r.last_seen ? L(` Last seen ${agoL(r.last_seen)}.`, ` கடைசியாக ${agoL(r.last_seen)} பார்க்கப்பட்டது.`) : '');
+    if (!r.blocked && !r.allowlisted && !r.protected) actions.push({ kind: 'block', ip: r.ip, label: L('Block ' + r.ip, r.ip + '-ஐத் தடு') });
+    links.push({ label: L('Open in IP Inspector', 'IP Inspector-இல் திற'), href: '#/tools?ip=' + r.ip });
+  }
+  else if (has(/what is|what are|what does|explain|meaning|என்றால்|விளக்க|அர்த்தம்/) && has(/port|scan|போர்ட்|ஸ்கேன்|brute|password|கடவுச்சொல்|flood|ddos|வெள்ளம்|canary|trap|கேனரி|பொறி|expos|telnet|rdp|score|மதிப்பெண்|lockdown/)) {
+    kind = 'explain';
+    const key = has(/port|scan|போர்ட்|ஸ்கேன்/) ? 'port_scan' : has(/brute|password|கடவுச்சொல்/) ? 'brute_force' : has(/flood|ddos|வெள்ளம்/) ? 'flood' : has(/canary|trap|கேனரி|பொறி/) ? 'canary' : has(/score|மதிப்பெண்/) ? 'score' : has(/lockdown/) ? 'lockdown' : 'exposed';
+    ans = EXPLAIN[key][ta ? 'ta' : 'en'];
+  }
+  else if (has(/how (do|to|can)|எப்படி|epdi|eppadi/) && has(/device|add|install|agent|சாதன|சேர்/)) {
+    kind = 'howto'; ans = L('To protect a machine: 1) open Devices, 2) click Add device and give it a name, 3) copy the install command and run it on that machine. It appears here within seconds.', 'ஒரு கணினியைப் பாதுகாக்க: 1) Devices பக்கத்தைத் திறக்கவும், 2) Add device-ஐ அழுத்தி ஒரு பெயர் கொடுக்கவும், 3) காட்டப்படும் install கட்டளையை அந்த கணினியில் இயக்கவும். சில வினாடிகளில் இங்கே தோன்றும்.'); links.push({ label: L('Open Devices', 'Devices-ஐத் திற'), href: '#/devices' });
+  }
+  else if (has(/how (do|to|can)|எப்படி|epdi|eppadi/) && has(/block|தடு|தடை/)) {
+    kind = 'howto'; ans = L('Type "block 203.0.113.5" here (with the real address), or use the Block button on the dashboard or in the IP Inspector.', 'இங்கே "block 203.0.113.5" (உண்மையான முகவரியுடன்) என தட்டச்சு செய்யுங்கள், அல்லது Dashboard / IP Inspector-இல் உள்ள Block பொத்தானை அழுத்துங்கள்.');
+  }
+  else if (has(/safe|score|secur|protect|risk|பாதுகாப்|மதிப்பெண்|ஸ்கோர்|ஆபத்து/)) {
+    kind = 'score';
+    ans = I.score == null ? L('You have no real devices yet, so there is nothing to score. Add a device on the Devices page.', 'உங்களிடம் உண்மையான சாதனங்கள் இல்லை, அதனால் மதிப்பெண் இல்லை. Devices பக்கத்தில் ஒரு சாதனத்தைச் சேர்க்கவும்.')
+      : L(`Your security score is ${I.score}/100 (${I.score >= 85 ? 'well protected' : I.score >= 60 ? 'needs attention' : 'at risk'}).`, `உங்கள் பாதுகாப்பு மதிப்பெண் ${I.score}/100 (${I.score >= 85 ? 'நன்கு பாதுகாக்கப்பட்டுள்ளது' : I.score >= 60 ? 'கவனம் தேவை' : 'ஆபத்தில் உள்ளது'}).`)
+        + (I.factors.length ? L(' To raise it: ', ' உயர்த்த: ') + I.factors.map((f) => `${fixL(f.fix)} (+${f.points})`).join('; ') + '.' : L(' Nothing needs fixing.', ' சரிசெய்ய எதுவும் இல்லை.'));
+  }
+  else if (has(/who|attack|top|hacker|யார்|தாக்க|ஹேக்/) && !has(/how|what should|என்ன செய்/)) {
+    kind = 'attackers';
+    ans = I.attackers.length ? L('Top attackers this week: ', 'இந்த வாரம் முன்னணி தாக்குபவர்கள்: ') + I.attackers.slice(0, 4).map((a) => `${a.ip} (${a.types.map(tName).join(', ')}, ${a.blocked ? L('blocked', 'தடுக்கப்பட்டது') : L('NOT blocked', 'தடுக்கப்படவில்லை')})`).join('; ') + '.' : L('No attackers seen in the last 7 days.', 'கடந்த 7 நாட்களில் தாக்குபவர்கள் யாரும் இல்லை.');
+    I.attackers.filter((a) => !a.blocked).slice(0, 2).forEach((a) => actions.push({ kind: 'block', ip: a.ip, label: L('Block ' + a.ip, a.ip + '-ஐத் தடு') }));
+  }
+  else if (has(/\bdo\b|fix|improve|recommend|advice|should|next|help me|என்ன செய்|ஆலோசனை|சரிசெய்|செய்யலாம்/)) {
+    kind = 'advice';
+    ans = I.factors.length ? L('My recommendations, most important first: ', 'என் பரிந்துரைகள், முக்கியமானவை முதலில்: ') + [...I.factors].sort((a, b) => b.points - a.points).map((f, i) => `${i + 1}. ${fixL(f.fix)}`).join(' ') : L('Everything looks healthy. Keep your agents updated and review alerts weekly.', 'எல்லாம் நன்றாக உள்ளது. agent-களைப் புதுப்பித்து வைத்து, வாரந்தோறும் அலெர்ட்களைப் பாருங்கள்.');
+    links.push({ label: L('Open Settings', 'Settings-ஐத் திற'), href: '#/settings' });
+  }
+  else if (has(/block|தடு|தடை/)) {
+    kind = 'blocks'; const n = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1').get(u).c;
+    ans = L(`${n} address(es) are blocked right now. Automatic blocking is ${I.auto_block ? 'on' : 'OFF'}.`, `இப்போது ${n} முகவரிகள் தடுக்கப்பட்டுள்ளன. தானியங்கித் தடை ${I.auto_block ? 'இயக்கத்தில்' : 'அணைந்துள்ளது'}.`); links.push({ label: L('Open Blocklist', 'Blocklist-ஐத் திற'), href: '#/blocks' });
+  }
+  else if (has(/device|agent|online|offline|server|சாதன|கருவி|ஆன்லைன்|ஆஃப்லைன்/)) {
+    kind = 'devices';
+    ans = devs.length ? devs.map((d) => `${d.name}: ${d.status === 'online' ? L('online', 'ஆன்லைன்') : L('offline', 'ஆஃப்லைன்')}${d.status === 'online' ? (d.enforce ? L(', enforcing', ', தடுக்கும் நிலை') : L(', monitor-only', ', கண்காணிப்பு மட்டும்')) : ''}`).join('. ') + '.' : L('No devices yet.', 'இன்னும் சாதனங்கள் இல்லை.');
+    links.push({ label: L('Open Devices', 'Devices-ஐத் திற'), href: '#/devices' });
+  }
+  else if (has(/today|happen|summary|status|report|24|hour|overview|going on|இன்று|நடந்த|சுருக்க|நிலை|நிலவரம்/)) {
+    kind = 'summary'; const worst = I.by_type[0];
+    ans = total24 ? L(`In the last 24 hours NetGuard raised ${total24} alert(s)` + (worst ? `, mostly ${lab(worst.type)}` : '') + `. ${I.attackers.filter((a) => a.blocked).length} attacker(s) are blocked. Security score: ${I.score == null ? 'n/a' : I.score + '/100'}.`,
+      `கடந்த 24 மணி நேரத்தில் NetGuard ${total24} அலெர்ட்களை எழுப்பியது` + (worst ? `, பெரும்பாலும் ${tName(worst.type)}` : '') + `. ${I.attackers.filter((a) => a.blocked).length} தாக்குபவர்கள் தடுக்கப்பட்டுள்ளனர். பாதுகாப்பு மதிப்பெண்: ${I.score == null ? 'இல்லை' : I.score + '/100'}.`) : L('Quiet day: no alerts in the last 24 hours.', 'அமைதியான நாள்: கடந்த 24 மணி நேரத்தில் அலெர்ட்கள் இல்லை.');
+    links.push({ label: L('Open full incident report', 'முழு அறிக்கையைத் திற'), href: '#/report' });
+  }
+  else {
+    ans = L('I can answer from your own data and do actions for you. Try: "Am I safe?", "What happened today?", "Who is attacking me?", "What should I do?", "What is a port scan?", "How do I add a device?", "lockdown on", "block 203.0.113.5", or paste an IP address. You can also write in Tamil.',
+      'உங்கள் தரவிலிருந்து பதில் சொல்லவும், செயல்களைச் செய்யவும் முடியும். கேளுங்கள்: "நான் பாதுகாப்பாக இருக்கிறேனா?", "இன்று என்ன நடந்தது?", "என்னை யார் தாக்குகிறார்கள்?", "நான் என்ன செய்ய வேண்டும்?", "போர்ட் ஸ்கேன் என்றால் என்ன?", "சாதனத்தை எப்படிச் சேர்ப்பது?", "lockdown on", "block 203.0.113.5", அல்லது ஒரு IP முகவரியை ஒட்டுங்கள்.');
+  }
+  return { answer: ans, links, actions, lang: ta ? 'ta' : 'en', kind };
+}
+route('POST', '/api/copilot', 'user', async (req, res, ctx) => {
+  if (!auth.rateLimit('cop:' + ctx.user.id, 60, 60000)) throw bad('Slow down', 429);
+  const lang = ['en', 'ta', 'auto', 'both'].includes(ctx.body.lang) ? ctx.body.lang : 'auto';
+  if (lang === 'both') {
+    const en = copilotAnswer(ctx.user.id, ctx.body.question, 'en'), ta = copilotAnswer(ctx.user.id, ctx.body.question, 'ta');
+    return send(res, 200, { answer: en.answer + '\n\n' + ta.answer, links: en.links, actions: en.actions, lang: 'both', kind: en.kind });
+  }
+  send(res, 200, copilotAnswer(ctx.user.id, ctx.body.question, lang));
 });
+
+// ------------------------------------------------------------------ simulator
+route('POST', '/api/sim/attack', 'user', async (req, res, ctx) => {
+  if (!['cyber', 'scan', 'brute', 'spark'].includes(ctx.body.type)) throw bad('Unknown attack type');
+  if (!auth.rateLimit('sim:' + ctx.user.id, 20, 60000)) throw bad('Slow down', 429);
+  if (!db.prepare('SELECT 1 FROM devices WHERE user_id=? AND virtual=1').get(ctx.user.id)) createDevice(ctx.user.id, 'Demo device (simulated)', 1);
+  const r = sim.start(ctx.user.id, ctx.body.type);
+  if (!r) throw bad('Demo device missing', 404);
+  send(res, 200, { ok: true, listening: hub.listeners(ctx.user.id), attacker_ip: r.ip });
+});
+route('POST', '/api/sim/reset', 'user', async (req, res, ctx) => { sim.reset(ctx.user.id); send(res, 200, { ok: true }); });
 
 // ------------------------------------------------------------------ canary traps (honeytokens)
 // A trap URL looks like a forgotten admin link. Nobody legitimate ever opens it, so whoever does is flagged and blocked.
@@ -394,21 +478,11 @@ function triggerCanary(c, ip, ua) {
   engine.log(u, null, 'CRIT', `${title} | ${action}`);
 }
 
-// ------------------------------------------------------------------ simulator
-route('POST', '/api/sim/attack', 'user', async (req, res, ctx) => {
-  if (!['cyber', 'scan', 'brute', 'spark'].includes(ctx.body.type)) throw bad('Unknown attack type');
-  if (!auth.rateLimit('sim:' + ctx.user.id, 20, 60000)) throw bad('Slow down', 429);
-  if (!db.prepare('SELECT 1 FROM devices WHERE user_id=? AND virtual=1').get(ctx.user.id)) createDevice(ctx.user.id, 'Demo device (simulated)', 1);
-  const r = sim.start(ctx.user.id, ctx.body.type);
-  if (!r) throw bad('Demo device missing', 404);
-  send(res, 200, { ok: true, listening: hub.listeners(ctx.user.id), attacker_ip: r.ip });
-});
-route('POST', '/api/sim/reset', 'user', async (req, res, ctx) => { sim.reset(ctx.user.id); send(res, 200, { ok: true }); });
 
 // ------------------------------------------------------------------ agent API (Bearer device key)
 route('POST', '/api/agent/telemetry', 'agent', async (req, res, ctx) => {
   if (!auth.rateLimit('tel:' + ctx.device.id, 120, 60000)) throw bad('Too many samples', 429);
-  if (ctx.device.virtual) throw bad('Not for the demo device', 400);
+  if (ctx.device.virtual) throw bad('Not allowed for this device', 400);
   send(res, 200, engine.ingest(ctx.device, ctx.body, ctx.ip));
 });
 route('POST', '/api/agent/event', 'agent', async (req, res, ctx) => {

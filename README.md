@@ -4,8 +4,7 @@ A multi-user network defense platform. Users sign up, install a small **agent** 
 want to protect, and NetGuard **learns normal traffic, detects attacks, blocks the attacker in the OS
 firewall, and alerts them** on a live dashboard and by webhook.
 
-It grew out of the original hackathon demo (attack buttons + fake alerts). The demo is still here as the
-**Simulator**, but it now drives the same detection engine real agents use.
+It started as a hackathon demo and is now a real tool: it only shows data from real agents and canary traps.
 
 ```
  your servers / PCs / gateways            NetGuard server (this repo)             your browser
@@ -40,7 +39,6 @@ node server/index.js          # or: npm start
 ```
 
 Open http://localhost:3000 and create an account. New accounts start empty: add a device and install the agent on it.
-For presentations only, **Settings -> Demo tools** reveals an attack simulator that feeds the same engine.
 
 Docker: `docker compose up -d`. Run tests: `npm test`.
 
@@ -89,7 +87,7 @@ Environment variables: `PORT`, `DATA_DIR` (database location), `ALLOW_SIGNUP=0` 
 ## Layout
 
 ```
-server/   index.js (HTTP+API) engine.js (detection) simulator.js db.js auth.js hub.js (SSE) notify.js settings.js
+server/   index.js (HTTP+API) engine.js (detection) db.js auth.js hub.js (SSE) notify.js settings.js
 public/   index.html styles.css app.js   (no build step)
 agent/    netguard_agent.py
 test/     e2e.js                          (37 checks against a live server)
