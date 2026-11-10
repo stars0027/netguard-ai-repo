@@ -3,7 +3,7 @@ const { db } = require('./db');
 const { json, clamp } = require('./util');
 
 const DEFAULTS = {
-  auto_block: true,          // block attackers automatically when confidence is high
+  auto_block: false,         // NEW accounts start with automatic blocking OFF (owner turns it on after a dry run)
   block_scope: 'fleet',      // 'fleet' = block on all your devices, 'device' = only the one attacked
   block_ttl_min: 60,         // auto-unblock after N minutes (0 = permanent)
   sensitivity: 'medium',     // low | medium | high -> how far from baseline counts as an anomaly
@@ -14,6 +14,15 @@ const DEFAULTS = {
   brute_force_attempts: 8,   // failed logins from ONE source within 60 s
   webhook_url: '',           // Slack / Discord / generic JSON webhook
 };
+
+// Accounts created before this version were effectively running with auto_block ON.
+// Freeze that value in their stored settings so changing the default never silently changes an existing account.
+try {
+  for (const u of db.prepare('SELECT id, settings FROM users').all()) {
+    const cur = json(u.settings) || {};
+    if (!('auto_block' in cur)) db.prepare('UPDATE users SET settings=? WHERE id=?').run(JSON.stringify({ ...cur, auto_block: true }), u.id);
+  }
+} catch { /* ignore */ }
 
 const cache = new Map(); // userId -> { at, value }  (settings are read on every telemetry sample)
 function getSettings(userId) {
@@ -51,4 +60,4 @@ function saveSettings(userId, patch) {
   return merged;
 }
 
-module.exports = { DEFAULTS, getSettings, saveSettings };
+module.exports = { DEFAULTS, getSettings, saveSettings, sanitizeSettings: sanitize };

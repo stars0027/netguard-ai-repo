@@ -8,9 +8,9 @@ const auth = require('./auth');
 const hub = require('./hub');
 const engine = require('./engine');
 const sim = require('./simulator');
-const { getSettings, saveSettings } = require('./settings');
+const { getSettings, saveSettings, sanitizeSettings } = require('./settings');
 const { sendWebhook } = require('./notify');
-const { now, cleanIp, clamp, json, randToken } = require('./util');
+const { now, cleanIp, clamp, json, randToken, sha256 } = require('./util');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC = path.join(__dirname, '..', 'public');
@@ -65,7 +65,7 @@ const publicDevice = (d) => {
   const st = engine.states.get(d.id);
   return {
     id: d.id, name: d.name, virtual: !!d.virtual, hostname: d.hostname, os: d.os, agent_version: d.agent_version,
-    enforce: !!d.enforce, status: d.status, last_seen: d.last_seen, key_prefix: d.virtual ? null : d.key_prefix, created: d.created,
+    enforce: !!d.enforce, mode: d.virtual ? 'demo' : (d.mode || 'live'), status: d.status, last_seen: d.last_seen, key_prefix: d.virtual ? null : d.key_prefix, created: d.created,
     live: st ? { pps: Math.round(st.lastPps), baseline: st.learned ? Math.round(st.mean) : null, state: engine.statusOf(st) } : null,
   };
 };
@@ -76,37 +76,151 @@ const userDevice = (user, id) => {
 };
 function createDevice(userId, name, virtual = 0) {
   const k = auth.newApiKey();
-  const r = db.prepare('INSERT INTO devices(user_id,name,key_hash,key_prefix,virtual,status,created) VALUES(?,?,?,?,?,?,?)')
-    .run(userId, name, k.hash, k.prefix, virtual, virtual ? 'online' : 'pending', now());
+  const r = db.prepare('INSERT INTO devices(user_id,name,key_hash,key_prefix,virtual,status,created,mode) VALUES(?,?,?,?,?,?,?,?)')
+    .run(userId, name, k.hash, k.prefix, virtual, virtual ? 'online' : 'pending', now(), virtual ? 'live' : 'monitor'); // new real devices start monitor-only (dry run)
   return { id: Number(r.lastInsertRowid), key: k.key };
 }
 const checkIp = (v) => { const ip = cleanIp(String(v || '')); if (!ip) throw bad('Enter a valid IPv4 or IPv6 address'); return ip; };
 
+// ------------------------------------------------------------------ owner settings (stored in the database)
+const crypto = require('node:crypto');
+const getMeta = (k, d = null) => { const r = db.prepare('SELECT value FROM meta WHERE key=?').get(k); return r ? r.value : d; };
+const setMeta = (k, v) => db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k, String(v));
+const signupMode = () => { const m = getMeta('signup_mode', process.env.SIGNUP_MODE || 'open'); return ['open', 'invite', 'closed'].includes(m) ? m : 'open'; };
+function deleteUser(id) {
+  for (const d of db.prepare('SELECT id FROM devices WHERE user_id=?').all(id)) { try { engine.forgetDevice(d.id); } catch { /* ignore */ } }
+  db.prepare('DELETE FROM users WHERE id=?').run(id);
+}
+try { db.exec('ALTER TABLE users ADD COLUMN last_login INTEGER'); } catch { /* column already exists */ }
+route('GET', '/api/public-config', 'public', async (req, res) => send(res, 200, { signup: ALLOW_SIGNUP ? signupMode() : 'closed' }));
+
 // ------------------------------------------------------------------ auth routes
+const twofa = require('./twofa');
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 route('POST', '/api/auth/signup', 'public', async (req, res, ctx) => {
-  if (!ALLOW_SIGNUP) throw bad('Sign-ups are disabled on this server', 403);
+  const mode = signupMode();
+  if (!ALLOW_SIGNUP || mode === 'closed') throw bad('Sign-ups are closed. Ask the site owner for access.', 403);
+  if (db.prepare('SELECT COUNT(*) c FROM users').get().c >= Number(process.env.MAX_USERS || 1000)) throw bad('This site has reached its user limit', 403);
+  if (mode === 'invite') {
+    const want = crypto.createHash('sha256').update(String(getMeta('invite_code', '') || '\u0000')).digest(), got = crypto.createHash('sha256').update(String(ctx.body.invite || '')).digest();
+    if (!getMeta('invite_code', '') || !crypto.timingSafeEqual(want, got)) throw bad('Wrong or missing invite code', 403);
+  }
   if (!auth.rateLimit('signup:' + ctx.ip, 10, 3600000)) throw bad('Too many sign-ups, try later', 429);
   const { email, password, name } = ctx.body;
   if (typeof email !== 'string' || !EMAIL.test(email)) throw bad('Enter a valid email');
   if (typeof password !== 'string' || password.length < 8 || password.length > 200) throw bad('Password must be 8 to 200 characters');
   const em = email.trim().toLowerCase();
   if (db.prepare('SELECT 1 FROM users WHERE email=?').get(em)) throw bad('An account with this email already exists', 409);
-  const r = db.prepare('INSERT INTO users(email,name,pass_hash,created) VALUES(?,?,?,?)')
-    .run(em, String(name || em.split('@')[0]).slice(0, 60), auth.hashPassword(password), now());
+  const pin = ctx.body.pin == null || ctx.body.pin === '' ? null : String(ctx.body.pin);
+  if (pin !== null && !/^\d{4}$/.test(pin)) throw bad('Security PIN must be exactly 4 digits');
+  if (em === DEMO_EMAIL) throw bad('This email is reserved', 409);
+  const r = db.prepare('INSERT INTO users(email,name,pass_hash,pin_hash,created) VALUES(?,?,?,?,?)')
+    .run(em, String(name || em.split('@')[0]).slice(0, 60), auth.hashPassword(password), pin ? auth.hashPassword(pin) : null, now());
   const uid = Number(r.lastInsertRowid);
   engine.log(uid, null, 'INFO', 'Welcome to NetGuard AI. Add your first device to start protecting it.');
   const token = auth.createSession(uid);
   send(res, 201, { ok: true }, { 'Set-Cookie': auth.cookieHeader(token, SECURE) });
 });
 
+// ---- login: password, then (if the account has one) a second step: PIN, authenticator code or e-mail code ----
+const fails = new Map(); // ip -> { n, until }   5 wrong passwords => that address is locked out for 5 minutes
+const lockLeft = (ip) => { const f = fails.get(ip); return f && f.until > now() ? Math.ceil((f.until - now()) / 60000) : 0; };
+const noteFail = (ip) => { const f = fails.get(ip) || { n: 0, until: 0 }; if (f.until && f.until <= now()) { f.n = 0; f.until = 0; } f.n += 1; if (f.n >= 5) { f.until = now() + 5 * 60000; f.n = 0; } fails.set(ip, f); };
+setInterval(() => { for (const [k, f] of fails) if (f.until < now() && !f.n) fails.delete(k); }, 600000).unref();
+const tickets = new Map(); // second-step tickets: token -> { uid, exp, tries, otp }
+setInterval(() => { for (const [k, t] of tickets) if (t.exp < now()) tickets.delete(k); }, 60000).unref();
+const methodsOf = (u) => [u.pin_hash ? 'pin' : null, u.totp_on ? 'totp' : null, u.email_otp && twofa.smtpReady() ? 'email' : null].filter(Boolean);
+const startSession = (res, uid, extra = {}) => {
+  db.prepare('UPDATE users SET last_login=? WHERE id=?').run(now(), uid);
+  send(res, 200, { ok: true, ...extra }, { 'Set-Cookie': auth.cookieHeader(auth.createSession(uid), SECURE) });
+};
+
 route('POST', '/api/auth/login', 'public', async (req, res, ctx) => {
-  if (!auth.rateLimit('login:' + ctx.ip, 10, 15 * 60000)) throw bad('Too many attempts, wait 15 minutes', 429);
+  const lock = lockLeft(ctx.ip);
+  if (lock) throw bad(`Too many wrong passwords. This device is locked out for ${lock} more minute${lock === 1 ? '' : 's'}.`, 429);
+  if (!auth.rateLimit('login:' + ctx.ip, 40, 15 * 60000)) throw bad('Too many attempts, wait 15 minutes', 429);
   const em = String(ctx.body.email || '').trim().toLowerCase();
   const u = db.prepare('SELECT * FROM users WHERE email=?').get(em);
-  const ok = u ? auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash) : (auth.verifyPassword('x', 's1$AAAAAAAAAAAAAAAAAAAAAA==$' + 'A'.repeat(86)), false);
-  if (!ok) throw bad('Wrong email or password', 401);
-  send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookieHeader(auth.createSession(u.id), SECURE) });
+  if (!u) { auth.verifyPassword('x', 's1$AAAAAAAAAAAAAAAAAAAAAA==$' + 'A'.repeat(86)); noteFail(ctx.ip); throw bad("Account not found for this email. Click 'CREATE AN ACCOUNT' below.", 401); }
+  if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) { noteFail(ctx.ip); throw bad('Incorrect password. Click the eye icon to verify your typing.', 401); }
+  fails.delete(ctx.ip);
+  const methods = methodsOf(u);
+  if (!methods.length || u.read_only) return startSession(res, u.id);
+  const ticket = crypto.randomBytes(24).toString('base64url');
+  const t = { uid: u.id, exp: now() + 5 * 60000, tries: 0, otp: null };
+  tickets.set(ticket, t);
+  if (methods.includes('email')) { t.otp = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); twofa.sendMail(u.email, 'Your NetGuard AI sign-in code', `Your NetGuard AI code is ${t.otp}. It expires in 5 minutes. If this was not you, change your password.`).catch(() => { t.otp = null; }); }
+  send(res, 200, { step2: true, ticket, methods });
+});
+
+route('POST', '/api/auth/verify', 'public', async (req, res, ctx) => {
+  const t = tickets.get(String(ctx.body.ticket || ''));
+  if (!t || t.exp < now()) throw bad('That sign-in session expired. Enter your email and password again.', 401);
+  if (++t.tries > 5) { tickets.delete(String(ctx.body.ticket)); throw bad('Too many wrong codes. Sign in again.', 429); }
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(t.uid);
+  const code = String(ctx.body.code || '').replace(/\s/g, '');
+  const good = u && ((u.pin_hash && /^\d{4}$/.test(code) && auth.verifyPassword(code, u.pin_hash))
+    || (u.totp_on && twofa.verifyTotp(u.totp_secret, code))
+    || (t.otp && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(t.otp), Buffer.from(code))));
+  if (!good) throw bad('Wrong code. Check your PIN, authenticator app or e-mail.', 401);
+  tickets.delete(String(ctx.body.ticket));
+  startSession(res, u.id);
+});
+
+// Privacy shield: the lock screen asks for the password or PIN again. The session stays, only the screen is protected.
+route('POST', '/api/auth/unlock', 'user', async (req, res, ctx) => {
+  if (!auth.rateLimit('unlock:' + ctx.user.id, 10, 5 * 60000)) throw bad('Too many tries. Wait 5 minutes.', 429);
+  const u = db.prepare('SELECT pass_hash, pin_hash, read_only FROM users WHERE id=?').get(ctx.user.id);
+  const secret = String(ctx.body.secret || '');
+  if (u.read_only) return send(res, 200, { ok: true });
+  if (!((u.pin_hash && /^\d{4}$/.test(secret) && auth.verifyPassword(secret, u.pin_hash)) || auth.verifyPassword(secret, u.pass_hash))) throw bad('Wrong password or PIN', 401);
+  send(res, 200, { ok: true });
+});
+
+// Sandbox: signs in to the shared read-only demo account (sample data only, nothing real).
+route('POST', '/api/auth/sandbox', 'public', async (req, res, ctx) => {
+  const u = db.prepare('SELECT id FROM users WHERE email=?').get(DEMO_EMAIL);
+  if (!u) throw bad('Sandbox is not available right now', 503);
+  if (!auth.rateLimit('sandbox:' + ctx.ip, 30, 600000)) throw bad('Too many tries', 429);
+  startSession(res, u.id);
+});
+
+// ---- security settings (PIN, authenticator, e-mail code) ----
+const needPassword = (ctx) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(ctx.user.id);
+  if (!auth.rateLimit('secpw:' + ctx.user.id, 10, 10 * 60000)) throw bad('Too many tries. Wait a few minutes.', 429);
+  if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) throw bad('Password is wrong', 403);
+  return u;
+};
+route('GET', '/api/security', 'user', async (req, res, ctx) => {
+  const u = db.prepare('SELECT pin_hash,totp_on,email_otp,read_only FROM users WHERE id=?').get(ctx.user.id);
+  send(res, 200, { pin: !!u.pin_hash, totp: !!u.totp_on, email: !!u.email_otp, email_available: twofa.smtpReady(), sandbox: !!u.read_only });
+});
+route('POST', '/api/security/pin', 'user', async (req, res, ctx) => {
+  needPassword(ctx);
+  if (!/^\d{4}$/.test(String(ctx.body.pin || ''))) throw bad('PIN must be exactly 4 digits');
+  db.prepare('UPDATE users SET pin_hash=? WHERE id=?').run(auth.hashPassword(String(ctx.body.pin)), ctx.user.id);
+  send(res, 200, { ok: true });
+});
+route('DELETE', '/api/security/pin', 'user', async (req, res, ctx) => { needPassword(ctx); db.prepare('UPDATE users SET pin_hash=NULL WHERE id=?').run(ctx.user.id); send(res, 200, { ok: true }); });
+route('POST', '/api/security/totp/setup', 'user', async (req, res, ctx) => {
+  needPassword(ctx);
+  const secret = twofa.newSecret();
+  db.prepare('UPDATE users SET totp_secret=?, totp_on=0 WHERE id=?').run(secret, ctx.user.id);
+  send(res, 200, { secret, uri: twofa.otpauthUri(secret, ctx.user.email) });
+});
+route('POST', '/api/security/totp/enable', 'user', async (req, res, ctx) => {
+  const u = db.prepare('SELECT totp_secret FROM users WHERE id=?').get(ctx.user.id);
+  if (!u.totp_secret || !twofa.verifyTotp(u.totp_secret, ctx.body.code)) throw bad('That code is not right. Check the time on your phone and try the next code.');
+  db.prepare('UPDATE users SET totp_on=1 WHERE id=?').run(ctx.user.id);
+  send(res, 200, { ok: true });
+});
+route('DELETE', '/api/security/totp', 'user', async (req, res, ctx) => { needPassword(ctx); db.prepare('UPDATE users SET totp_on=0, totp_secret=NULL WHERE id=?').run(ctx.user.id); send(res, 200, { ok: true }); });
+route('POST', '/api/security/email', 'user', async (req, res, ctx) => {
+  needPassword(ctx);
+  if (!twofa.smtpReady()) throw bad('E-mail codes are not set up on this server (SMTP_EMAIL / SMTP_PASSWORD missing).');
+  db.prepare('UPDATE users SET email_otp=? WHERE id=?').run(ctx.body.on ? 1 : 0, ctx.user.id);
+  send(res, 200, { ok: true });
 });
 
 route('POST', '/api/auth/logout', 'user', async (req, res, ctx) => {
@@ -124,7 +238,16 @@ route('POST', '/api/auth/password', 'user', async (req, res, ctx) => {
   send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookieHeader(auth.createSession(ctx.user.id), SECURE) });
 });
 
-route('GET', '/api/me', 'user', async (req, res, ctx) => send(res, 200, { id: ctx.user.id, email: ctx.user.email, name: ctx.user.name }));
+route('GET', '/api/me', 'user', async (req, res, ctx) => send(res, 200, { id: ctx.user.id, email: ctx.user.email, name: ctx.user.name, sandbox: ctx.user.read_only }));
+
+// delete my own account and all my data
+route('DELETE', '/api/me', 'user', async (req, res, ctx) => {
+  const u = db.prepare('SELECT pass_hash FROM users WHERE id=?').get(ctx.user.id);
+  if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) throw bad('Password is wrong', 403);
+  deleteUser(ctx.user.id);
+  send(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookieHeader() });
+});
+
 
 // ------------------------------------------------------------------ devices
 route('GET', '/api/devices', 'user', async (req, res, ctx) =>
@@ -137,6 +260,29 @@ route('POST', '/api/devices', 'user', async (req, res, ctx) => {
   if (n >= 100) throw bad('Device limit reached');
   const d = createDevice(ctx.user.id, name);
   send(res, 201, { device: publicDevice(db.prepare('SELECT * FROM devices WHERE id=?').get(d.id)), api_key: d.key });
+});
+
+// Per-device protection mode. 'monitor' = dry run (alerts say what WOULD be blocked, nothing is blocked).
+// Switching a device to 'live' needs an explicit confirmation from the owner.
+route('PATCH', '/api/devices/:id/mode', 'user', async (req, res, ctx) => {
+  const d = userDevice(ctx.user, ctx.params.id);
+  if (d.virtual) throw bad('The Demo device is always simulated and never touches a real firewall');
+  const mode = ctx.body.mode;
+  if (!['monitor', 'live'].includes(mode)) throw bad('Mode must be monitor or live');
+  if (mode === 'live' && ctx.body.confirm !== true) throw bad('Confirmation needed: switching a device to live blocking lets NetGuard block attacker IPs on it.', 409);
+  db.prepare('UPDATE devices SET mode=? WHERE id=?').run(mode, d.id);
+  engine.log(ctx.user.id, d.id, 'INFO', `${d.name}: protection mode set to ${mode === 'live' ? 'live blocking' : 'monitor-only (dry run)'}`);
+  hub.emit(ctx.user.id, 'device', { id: d.id, mode });
+  send(res, 200, publicDevice(db.prepare('SELECT * FROM devices WHERE id=?').get(d.id)));
+});
+
+route('PATCH', '/api/devices/:id', 'user', async (req, res, ctx) => {
+  const d = userDevice(ctx.user, ctx.params.id);
+  if (d.virtual) throw bad('The Demo device cannot be renamed');
+  const name = String(ctx.body.name || '').trim().slice(0, 60);
+  if (!name) throw bad('Give the device a name');
+  db.prepare('UPDATE devices SET name=? WHERE id=?').run(name, d.id);
+  send(res, 200, publicDevice(db.prepare('SELECT * FROM devices WHERE id=?').get(d.id)));
 });
 
 route('POST', '/api/devices/:id/rotate-key', 'user', async (req, res, ctx) => {
@@ -165,9 +311,10 @@ route('GET', '/api/metrics/:id', 'user', async (req, res, ctx) => {
 route('GET', '/api/alerts', 'user', async (req, res, ctx) => {
   const status = ctx.query.get('status');
   const limit = clamp(ctx.query.get('limit'), 1, 500, 100);
+  const demo = ctx.query.get('demo') === '1' ? 1 : 0; // real alerts by default, demo alerts only when asked for
   const rows = status && ['open', 'ack', 'resolved'].includes(status)
-    ? db.prepare('SELECT * FROM alerts WHERE user_id=? AND status=? ORDER BY created DESC LIMIT ?').all(ctx.user.id, status, limit)
-    : db.prepare('SELECT * FROM alerts WHERE user_id=? ORDER BY created DESC LIMIT ?').all(ctx.user.id, limit);
+    ? db.prepare('SELECT * FROM alerts WHERE user_id=? AND demo=? AND status=? ORDER BY created DESC LIMIT ?').all(ctx.user.id, demo, status, limit)
+    : db.prepare('SELECT * FROM alerts WHERE user_id=? AND demo=? ORDER BY created DESC LIMIT ?').all(ctx.user.id, demo, limit);
   send(res, 200, rows.map(engine.publicAlert));
 });
 
@@ -182,6 +329,7 @@ route('PATCH', '/api/alerts/:id', 'user', async (req, res, ctx) => {
 route('POST', '/api/alerts/:id/block', 'user', async (req, res, ctx) => {
   const a = db.prepare('SELECT * FROM alerts WHERE id=? AND user_id=?').get(Number(ctx.params.id), ctx.user.id);
   if (!a || !a.src_ip) throw bad('This alert has no source IP to block', 404);
+  if (a.demo) throw bad('This is a Demo alert. Demo alerts cannot create real firewall blocks.', 409);
   const why = engine.protectedReason(ctx.user.id, a.src_ip);
   if (why) throw bad(`Cannot block ${a.src_ip}: ${why}`, 409);
   const cfg = getSettings(ctx.user.id);
@@ -192,9 +340,10 @@ route('POST', '/api/alerts/:id/block', 'user', async (req, res, ctx) => {
 
 // ------------------------------------------------------------------ blocks + allowlist
 route('GET', '/api/blocks', 'user', async (req, res, ctx) => {
-  const rows = db.prepare('SELECT * FROM blocks WHERE user_id=? AND active=1 ORDER BY created DESC').all(ctx.user.id);
-  const enforcing = db.prepare('SELECT COUNT(*) c FROM devices WHERE user_id=? AND enforce=1 AND status=\'online\'').get(ctx.user.id).c;
-  send(res, 200, { enforcing_devices: enforcing, blocks: rows.map((b) => ({ ...b, applied: engine.appliedCount(ctx.user.id, b.ip) })) });
+  const demo = ctx.query.get('demo') === '1' ? 1 : 0;
+  const rows = db.prepare('SELECT * FROM blocks WHERE user_id=? AND demo=? AND active=1 ORDER BY created DESC').all(ctx.user.id, demo);
+  const enforcing = db.prepare('SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=0 AND enforce=1 AND status=\'online\'').get(ctx.user.id).c;
+  send(res, 200, { demo: !!demo, enforcing_devices: enforcing, blocks: rows.map((b) => ({ ...b, applied: engine.appliedCount(ctx.user.id, b.ip) })) });
 });
 
 route('POST', '/api/blocks', 'user', async (req, res, ctx) => {
@@ -215,7 +364,7 @@ route('GET', '/api/allowlist', 'user', async (req, res, ctx) => send(res, 200, d
 route('POST', '/api/allowlist', 'user', async (req, res, ctx) => {
   const ip = checkIp(ctx.body.ip);
   db.prepare('INSERT OR IGNORE INTO allowlist(user_id,ip,note) VALUES(?,?,?)').run(ctx.user.id, ip, String(ctx.body.note || '').slice(0, 100));
-  for (const b of db.prepare('SELECT id FROM blocks WHERE user_id=? AND ip=? AND active=1').all(ctx.user.id, ip)) engine.removeBlock(ctx.user.id, b.id);
+  for (const b of db.prepare('SELECT id FROM blocks WHERE user_id=? AND ip=? AND active=1 AND demo=0').all(ctx.user.id, ip)) engine.removeBlock(ctx.user.id, b.id);
   send(res, 201, { ok: true });
 });
 route('DELETE', '/api/allowlist/:id', 'user', async (req, res, ctx) => {
@@ -226,6 +375,15 @@ route('DELETE', '/api/allowlist/:id', 'user', async (req, res, ctx) => {
 // ------------------------------------------------------------------ settings, stats, logs
 route('GET', '/api/settings', 'user', async (req, res, ctx) => send(res, 200, getSettings(ctx.user.id)));
 route('PUT', '/api/settings', 'user', async (req, res, ctx) => {
+  const before = getSettings(ctx.user.id);
+  let patch;
+  try { patch = sanitizeSettings(ctx.body); } catch (e) { throw bad(e.message); }
+  // 0 off, 1 automatic blocking on one device, 2 automatic blocking on ALL devices, 3 Lockdown (all devices + high sensitivity)
+  const level = (c) => (!c.auto_block ? 0 : c.sensitivity === 'high' ? 3 : c.block_scope === 'fleet' ? 2 : 1);
+  const after = { ...before, ...patch };
+  if (level(after) >= 2 && level(after) > level(before) && ctx.body.confirm_broad !== true) {
+    throw bad('Confirmation needed: this turns on broad automatic blocking across all your devices.', 409);
+  }
   try { send(res, 200, saveSettings(ctx.user.id, ctx.body)); } catch (e) { throw bad(e.message); }
 });
 route('POST', '/api/settings/test-webhook', 'user', async (req, res, ctx) => {
@@ -235,27 +393,48 @@ route('POST', '/api/settings/test-webhook', 'user', async (req, res, ctx) => {
   send(res, 200, { ok: true });
 });
 
-route('GET', '/api/stats', 'user', async (req, res, ctx) => {
-  const u = ctx.user.id, day = now() - 86400000;
+// ONE source of truth for every number in the app (dashboard, nav badge, Alerts, War Room, Report, Copilot).
+// Real and Demo are counted separately; the "real" block never includes simulator data.
+function summaryFor(u) {
+  const day = now() - 86400000;
   const c = (sql, ...a) => db.prepare(sql).get(...a).c;
-  send(res, 200, {
-    devices: c('SELECT COUNT(*) c FROM devices WHERE user_id=?', u),
-    online: c("SELECT COUNT(*) c FROM devices WHERE user_id=? AND status='online'", u),
-    open_alerts: c("SELECT COUNT(*) c FROM alerts WHERE user_id=? AND status='open'", u),
-    alerts_24h: c('SELECT COUNT(*) c FROM alerts WHERE user_id=? AND created>?', u, day),
-    blocked_total: c("SELECT COUNT(*) c FROM blocks WHERE user_id=? AND source='auto'", u),
-    active_blocks: c('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1', u),
-  });
-});
+  const cfg = getSettings(u);
+  const real = {
+    devices: c('SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=0', u),
+    online: c("SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=0 AND status='online'", u),
+    open_alerts: c("SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=0 AND status='open'", u),
+    alerts_24h: c('SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=0 AND created>?', u, day),
+    alerts_total: c('SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=0', u),
+    blocked_total: c("SELECT COUNT(*) c FROM blocks WHERE user_id=? AND demo=0 AND source='auto'", u),
+    active_blocks: c('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND demo=0 AND active=1', u),
+    dry_run_devices: c("SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=0 AND mode='monitor'", u),
+    live_devices: c("SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=0 AND mode='live'", u),
+  };
+  const demo = {
+    exists: c('SELECT COUNT(*) c FROM devices WHERE user_id=? AND virtual=1', u) > 0,
+    open_alerts: c("SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=1 AND status='open'", u),
+    alerts_total: c('SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=1', u),
+    active_blocks: c('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND demo=1 AND active=1', u),
+  };
+  const protection = {
+    auto_block: !!cfg.auto_block, block_scope: cfg.block_scope, block_ttl_min: cfg.block_ttl_min,
+    sensitivity: cfg.sensitivity, lockdown: !!cfg.auto_block && cfg.sensitivity === 'high',
+    // what automatic blocking actually does right now
+    effective: !cfg.auto_block ? 'off' : (real.live_devices === 0 ? 'dry-run' : 'live'),
+  };
+  return { ...real, real, demo, protection, generated: now() };
+}
+route('GET', '/api/stats', 'user', async (req, res, ctx) => send(res, 200, summaryFor(ctx.user.id)));
+route('GET', '/api/summary', 'user', async (req, res, ctx) => send(res, 200, summaryFor(ctx.user.id)));
 
 route('GET', '/api/logs', 'user', async (req, res, ctx) =>
-  send(res, 200, db.prepare('SELECT id,ts,level,msg,device_id FROM logs WHERE user_id=? ORDER BY id DESC LIMIT ?').all(ctx.user.id, clamp(ctx.query.get('limit'), 1, 500, 80)).reverse()));
+  send(res, 200, db.prepare('SELECT id,ts,level,msg,device_id,demo FROM logs WHERE user_id=? AND demo=? ORDER BY id DESC LIMIT ?').all(ctx.user.id, ctx.query.get('demo') === '1' ? 1 : 0, clamp(ctx.query.get('limit'), 1, 500, 80)).reverse()));
 
 // ------------------------------------------------------------------ insights, export
 function insightsFor(u) {
   const t = now(), cfg = getSettings(u);
   const devs = db.prepare('SELECT status, enforce, virtual FROM devices WHERE user_id=? AND virtual=0').all(u);
-  const open = db.prepare("SELECT severity, COUNT(*) c FROM alerts WHERE user_id=? AND status='open' GROUP BY severity").all(u);
+  const open = db.prepare("SELECT severity, COUNT(*) c FROM alerts WHERE user_id=? AND demo=0 AND status='open' GROUP BY severity").all(u);
   const n = (sev) => (open.find((o) => o.severity === sev) || { c: 0 }).c;
   // security score: starts at 100, loses points for real, fixable problems; each one comes with the fix
   const factors = [];
@@ -274,21 +453,21 @@ function insightsFor(u) {
 
   const since24 = t - 86400000;
   const buckets = Array.from({ length: 24 }, (_, i) => ({ start: since24 + i * 3600000, critical: 0, high: 0, other: 0 }));
-  for (const a of db.prepare('SELECT created, severity FROM alerts WHERE user_id=? AND created>?').all(u, since24)) {
+  for (const a of db.prepare('SELECT created, severity FROM alerts WHERE user_id=? AND demo=0 AND created>?').all(u, since24)) {
     const b = buckets[Math.min(23, Math.floor((a.created - since24) / 3600000))];
     if (a.severity === 'critical') b.critical++; else if (a.severity === 'high') b.high++; else b.other++;
   }
   const since7 = t - 7 * 86400000;
-  const by_type = db.prepare('SELECT type, COUNT(*) c FROM alerts WHERE user_id=? AND created>? GROUP BY type ORDER BY c DESC').all(u, since7);
-  const attackers = db.prepare("SELECT src_ip ip, COUNT(*) alerts, MAX(created) last, GROUP_CONCAT(DISTINCT type) types FROM alerts WHERE user_id=? AND src_ip IS NOT NULL AND created>? GROUP BY src_ip ORDER BY alerts DESC, last DESC LIMIT 6").all(u, since7)
-    .map((a) => ({ ...a, types: String(a.types || '').split(','), blocked: !!db.prepare('SELECT 1 FROM blocks WHERE user_id=? AND ip=? AND active=1').get(u, a.ip) }));
+  const by_type = db.prepare('SELECT type, COUNT(*) c FROM alerts WHERE user_id=? AND demo=0 AND created>? GROUP BY type ORDER BY c DESC').all(u, since7);
+  const attackers = db.prepare("SELECT src_ip ip, COUNT(*) alerts, MAX(created) last, GROUP_CONCAT(DISTINCT type) types FROM alerts WHERE user_id=? AND demo=0 AND src_ip IS NOT NULL AND created>? GROUP BY src_ip ORDER BY alerts DESC, last DESC LIMIT 6").all(u, since7)
+    .map((a) => ({ ...a, types: String(a.types || '').split(','), blocked: !!db.prepare('SELECT 1 FROM blocks WHERE user_id=? AND demo=0 AND ip=? AND active=1').get(u, a.ip) }));
   return { score, factors, timeline: buckets, by_type, attackers, auto_block: !!cfg.auto_block, sensitivity: cfg.sensitivity };
 }
 route('GET', '/api/insights', 'user', async (req, res, ctx) => send(res, 200, insightsFor(ctx.user.id)));
 
 route('GET', '/api/alerts.csv', 'user', async (req, res, ctx) => {
   const cell = (v) => { let s = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
-  const rows = db.prepare('SELECT * FROM alerts WHERE user_id=? ORDER BY created DESC LIMIT 5000').all(ctx.user.id);
+  const rows = db.prepare('SELECT * FROM alerts WHERE user_id=? AND demo=0 ORDER BY created DESC LIMIT 5000').all(ctx.user.id);
   const csv = ['time_utc,severity,type,title,source_ip,device,action,status,count']
     .concat(rows.map((a) => [new Date(a.created).toISOString(), a.severity, a.type, a.title, a.src_ip, a.device_name, a.action, a.status, a.count].map(cell).join(','))).join('\r\n');
   res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="netguard-alerts.csv"', 'Cache-Control': 'no-store', ...HEADERS });
@@ -300,8 +479,8 @@ const LABEL = { flood: 'traffic flood', port_scan: 'port scan', brute_force: 'br
 const lab = (t) => LABEL[t] || String(t).replace(/_/g, ' ');
 const ago = (ts) => { const m = Math.round((now() - ts) / 60000); return m < 1 ? 'just now' : m < 90 ? m + ' min ago' : m < 2880 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' days ago'; };
 function ipReport(u, ip) {
-  const alerts = db.prepare('SELECT id,created,type,severity,title,action,status FROM alerts WHERE user_id=? AND src_ip=? ORDER BY created DESC LIMIT 30').all(u, ip);
-  const blocks = db.prepare('SELECT reason,source,created,expires,active FROM blocks WHERE user_id=? AND ip=? ORDER BY created DESC LIMIT 10').all(u, ip);
+  const alerts = db.prepare('SELECT id,created,type,severity,title,action,status FROM alerts WHERE user_id=? AND demo=0 AND src_ip=? ORDER BY created DESC LIMIT 30').all(u, ip);
+  const blocks = db.prepare('SELECT reason,source,created,expires,active FROM blocks WHERE user_id=? AND demo=0 AND ip=? ORDER BY created DESC LIMIT 10').all(u, ip);
   const allow = db.prepare('SELECT note FROM allowlist WHERE user_id=? AND ip=?').get(u, ip);
   const protectedWhy = engine.protectedReason(u, ip) || null;
   const types = [...new Set(alerts.map((a) => a.type))];
@@ -319,8 +498,8 @@ route('GET', '/api/hunt', 'user', async (req, res, ctx) => {
   const q = String(ctx.query.get('q') || '').trim().slice(0, 80);
   if (q.length < 2) throw bad('Type at least 2 characters');
   const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
-  const alerts = db.prepare("SELECT id,created,type,severity,title,src_ip,device_name,action,status FROM alerts WHERE user_id=? AND (title LIKE ? ESCAPE '\\' OR src_ip LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\' OR device_name LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\') ORDER BY created DESC LIMIT 50").all(ctx.user.id, like, like, like, like, like);
-  const logs = db.prepare("SELECT id,ts,level,msg FROM logs WHERE user_id=? AND msg LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 50").all(ctx.user.id, like);
+  const alerts = db.prepare("SELECT id,created,type,severity,title,src_ip,device_name,action,status FROM alerts WHERE user_id=? AND demo=0 AND (title LIKE ? ESCAPE '\\' OR src_ip LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\' OR device_name LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\') ORDER BY created DESC LIMIT 50").all(ctx.user.id, like, like, like, like, like);
+  const logs = db.prepare("SELECT id,ts,level,msg FROM logs WHERE user_id=? AND demo=0 AND msg LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 50").all(ctx.user.id, like);
   send(res, 200, { alerts, logs });
 });
 
@@ -404,7 +583,7 @@ function copilotAnswer(u, rawQ, lang) {
     links.push({ label: L('Open Settings', 'Settings-ஐத் திற'), href: '#/settings' });
   }
   else if (has(/block|தடு|தடை/)) {
-    kind = 'blocks'; const n = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1').get(u).c;
+    kind = 'blocks'; const n = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND demo=0 AND active=1').get(u).c;
     ans = L(`${n} address(es) are blocked right now. Automatic blocking is ${I.auto_block ? 'on' : 'OFF'}.`, `இப்போது ${n} முகவரிகள் தடுக்கப்பட்டுள்ளன. தானியங்கித் தடை ${I.auto_block ? 'இயக்கத்தில்' : 'அணைந்துள்ளது'}.`); links.push({ label: L('Open Blocklist', 'Blocklist-ஐத் திற'), href: '#/blocks' });
   }
   else if (has(/device|agent|online|offline|server|சாதன|கருவி|ஆன்லைன்|ஆஃப்லைன்/)) {
@@ -438,9 +617,9 @@ const clean = (v, n = 80) => String(v == null ? '' : v).replace(/[^\p{L}\p{N} .:
 function aiContext(u) {
   const I = insightsFor(u), t = now();
   const devs = db.prepare('SELECT name,status,enforce FROM devices WHERE user_id=? AND virtual=0').all(u).map((d) => ({ name: clean(d.name, 40), status: d.status, enforcing: !!d.enforce }));
-  const recent = db.prepare('SELECT created,type,severity,src_ip,action,status FROM alerts WHERE user_id=? ORDER BY created DESC LIMIT 12').all(u)
+  const recent = db.prepare('SELECT created,type,severity,src_ip,action,status FROM alerts WHERE user_id=? AND demo=0 ORDER BY created DESC LIMIT 12').all(u)
     .map((a) => ({ minutes_ago: Math.round((t - a.created) / 60000), type: a.type, severity: a.severity, ip: a.src_ip, action: clean(a.action, 70), status: a.status }));
-  const blocked = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND active=1').get(u).c;
+  const blocked = db.prepare('SELECT COUNT(*) c FROM blocks WHERE user_id=? AND demo=0 AND active=1').get(u).c;
   return { security_score: I.score, score_problems: I.factors.map((f) => ({ problem: f.label, fix: f.fix, points_lost: f.points })), auto_block_on: I.auto_block, sensitivity: I.sensitivity,
     devices: devs, blocked_addresses_now: blocked, alerts_last_24h: I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0), attack_types_7d: I.by_type.map((x) => ({ type: x.type, count: x.c })),
     top_attackers_7d: I.attackers.map((a) => ({ ip: a.ip, types: a.types, alerts: a.alerts, blocked: a.blocked })), recent_alerts: recent };
@@ -517,7 +696,6 @@ route('POST', '/api/sim/reset', 'user', async (req, res, ctx) => { sim.reset(ctx
 
 // ------------------------------------------------------------------ canary traps (honeytokens)
 // A trap URL looks like a forgotten admin link. Nobody legitimate ever opens it, so whoever does is flagged and blocked.
-const crypto = require('node:crypto');
 route('GET', '/api/canaries', 'user', async (req, res, ctx) => send(res, 200, db.prepare('SELECT id,token,label,hits,last_hit,created FROM canaries WHERE user_id=? ORDER BY id DESC').all(ctx.user.id)));
 route('POST', '/api/canaries', 'user', async (req, res, ctx) => {
   const label = String(ctx.body.label || '').trim().slice(0, 60) || 'Trap link';
@@ -596,13 +774,14 @@ const server = http.createServer(async (req, res) => {
         ctx.user = auth.userFromRequest(req);
         if (!ctx.user) throw bad('Sign in required', 401);
         if (req.method !== 'GET' && req.headers['x-requested-with'] !== 'NetGuard') throw bad('Missing CSRF header', 403);
+        if (ctx.user.read_only && req.method !== 'GET' && !['/api/auth/logout', '/api/auth/unlock', '/api/copilot'].includes(url.pathname)) throw bad('This is the read-only sandbox. Create your own account to change things.', 403);
       } else if (r.mode === 'agent') {
         ctx.device = auth.deviceFromRequest(req);
         if (!ctx.device) throw bad('Invalid or missing API key', 401);
       } else if (r.mode === 'public' && req.method !== 'GET' && req.headers['x-requested-with'] !== 'NetGuard') {
         throw bad('Missing CSRF header', 403);
       }
-      if (req.method !== 'GET' && req.method !== 'DELETE') ctx.body = await readBody(req);
+      if (req.method !== 'GET') ctx.body = await readBody(req);
       return await r.handler(req, res, ctx);
     }
 
@@ -678,6 +857,53 @@ echo "Check status: systemctl status netguard-agent   |   Uninstall: systemctl d
 function lanAddresses() {
   return Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address);
 }
+
+
+// ------------------------------------------------------------------ startup seeding (Render free plan wipes the database on restart)
+const DEMO_EMAIL = 'demo@netguard.ai';
+const DEMO_PASSWORD = 'NetGuardDemo2026!'; // public on purpose: this account is a read-only sandbox with sample data only
+function seedAccounts() {
+  // 1) Owner account from environment variables. No default password is built in, so nobody can sign in with a password that is public.
+  const ae = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase(), ap = process.env.ADMIN_PASSWORD;
+  if (ae && ap && EMAIL.test(ae) && ap.length >= 8 && !db.prepare('SELECT 1 FROM users WHERE email=?').get(ae)) {
+    const pin = /^\d{4}$/.test(process.env.ADMIN_PIN || '') ? auth.hashPassword(process.env.ADMIN_PIN) : null;
+    db.prepare('INSERT INTO users(email,name,pass_hash,pin_hash,created) VALUES(?,?,?,?,?)').run(ae, 'Owner', auth.hashPassword(ap), pin, now());
+  }
+  // 2) Isolated read-only sandbox with sample data, rebuilt on every start so the timestamps are fresh.
+  let u = db.prepare('SELECT id FROM users WHERE email=?').get(DEMO_EMAIL);
+  if (!u) { const r = db.prepare('INSERT INTO users(email,name,pass_hash,read_only,created) VALUES(?,?,?,1,?)').run(DEMO_EMAIL, 'Sandbox demo', auth.hashPassword(DEMO_PASSWORD), now()); u = { id: Number(r.lastInsertRowid) }; }
+  db.prepare('UPDATE users SET read_only=1, pin_hash=NULL, totp_on=0, totp_secret=NULL, email_otp=0 WHERE id=?').run(u.id);
+  const uid = u.id, t = now();
+  for (const d of db.prepare('SELECT id FROM devices WHERE user_id=?').all(uid)) engine.forgetDevice(d.id);
+  for (const tb of ['alerts', 'blocks', 'logs', 'devices', 'allowlist']) db.prepare(`DELETE FROM ${tb} WHERE user_id=?`).run(uid);
+  const mk = (name, host, os) => {
+    const k = auth.newApiKey();
+    return Number(db.prepare('INSERT INTO devices(user_id,name,hostname,os,agent_version,key_hash,key_prefix,virtual,status,last_seen,created,mode,enforce) VALUES(?,?,?,?,?,?,?,0,?,?,?,?,1)')
+      .run(uid, name, host, os, 'sample', k.hash, k.prefix, 'online', t, t, 'live').lastInsertRowid);
+  };
+  const d1 = mk('Prod-Edge-Gateway-01', 'edge-gw-01', 'Linux (sample)'), d2 = mk('SCADA-PLC-Node-04', 'plc-node-04', 'Windows (sample)');
+  const alert = (dev, name, type, sev, ip, title, action, mins, status = 'open') => {
+    const c = t - mins * 60000;
+    db.prepare('INSERT INTO alerts(user_id,device_id,device_name,type,severity,src_ip,title,detail,status,count,created,updated,action,demo) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)')
+      .run(uid, dev, name, type, sev, ip, title, '{"sample":true}', status, 1, c, c, action);
+  };
+  alert(d1, 'Prod-Edge-Gateway-01', 'flood', 'critical', '198.51.100.23', 'Traffic spike: 4,800 pkt/s from 198.51.100.23', 'Blocked 198.51.100.23 on all your devices', 8);
+  alert(d1, 'Prod-Edge-Gateway-01', 'port_scan', 'high', '203.0.113.77', 'Port scan: 24 ports in 30 s from 203.0.113.77', 'Blocked 203.0.113.77 on all your devices', 35);
+  alert(d2, 'SCADA-PLC-Node-04', 'brute_force', 'high', '192.0.2.88', '9 failed logins in 60 s from 192.0.2.88', 'Blocked 192.0.2.88 on all your devices', 90, 'ack');
+  alert(d2, 'SCADA-PLC-Node-04', 'exposed_port', 'medium', null, 'Modbus port 502 is open to all addresses', 'Restrict port 502 to your plant network.', 200);
+  const setDetail = (type, o) => db.prepare('UPDATE alerts SET detail=? WHERE user_id=? AND type=?').run(JSON.stringify({ ...o, sample: true }), uid, type);
+  setDetail('flood', { pps: 4800, baseline_mean: 120, ports: [80, 443] }); setDetail('port_scan', { pps: 310, ports: [21, 22, 23, 25, 80, 443, 502, 3389] });
+  setDetail('brute_force', { attempts: 9, ports: [22], pps: 40 }); setDetail('exposed_port', { ports: [502] });
+  for (const [ip, why, m] of [['198.51.100.23', 'Traffic spike: 4,800 pkt/s', 8], ['203.0.113.77', 'Port scan', 35], ['192.0.2.88', 'Brute-force login', 90]]) {
+    db.prepare("INSERT INTO blocks(user_id,device_id,ip,reason,source,scope,active,created,expires,demo) VALUES(?,?,?,?,'auto','fleet',1,?,?,0)").run(uid, null, ip, why, t - m * 60000, t + 3600000);
+  }
+  for (const [lvl, msg, m] of [['OK', 'Prod-Edge-Gateway-01 is online (sample data)', 240], ['CRIT', 'Traffic spike: 4,800 pkt/s from 198.51.100.23 | Blocked 198.51.100.23', 8], ['OK', 'Firewall rule created: block 198.51.100.23', 8]]) {
+    db.prepare('INSERT INTO logs(user_id,device_id,ts,level,msg,demo) VALUES(?,?,?,?,?,0)').run(uid, d1, t - m * 60000, lvl, msg);
+  }
+  for (let i = 0; i < 120; i++) db.prepare('INSERT INTO metrics(device_id,ts,pps) VALUES(?,?,?)').run(d1, t - (120 - i) * 2000, 110 + Math.round(Math.sin(i / 6) * 15) + (i > 100 ? 40 * (i - 100) : 0));
+}
+try { seedAccounts(); } catch (e) { console.error('seed failed:', e.message); }
+setInterval(() => { try { seedAccounts(); } catch { /* ignore */ } }, 3600000).unref();
 
 if (require.main === module) {
   server.listen(PORT, process.env.HOST || '0.0.0.0', () => {

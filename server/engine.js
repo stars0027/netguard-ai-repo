@@ -46,8 +46,10 @@ const forgetDevice = (id) => states.delete(id);
 // ------------------------------------------------------------------ logging / alert plumbing
 function log(userId, deviceId, level, msg) {
   const ts = now();
-  const r = db.prepare('INSERT INTO logs(user_id,device_id,ts,level,msg) VALUES(?,?,?,?,?)').run(userId, deviceId || null, ts, level, String(msg).slice(0, 500));
-  hub.emit(userId, 'log', { id: Number(r.lastInsertRowid), ts, level, msg, device_id: deviceId || null });
+  let demo = 0;
+  if (deviceId) { const d = db.prepare('SELECT virtual FROM devices WHERE id=?').get(deviceId); demo = d && d.virtual ? 1 : 0; }
+  const r = db.prepare('INSERT INTO logs(user_id,device_id,ts,level,msg,demo) VALUES(?,?,?,?,?,?)').run(userId, deviceId || null, ts, level, String(msg).slice(0, 500), demo);
+  hub.emit(userId, 'log', { id: Number(r.lastInsertRowid), ts, level, msg, device_id: deviceId || null, demo });
 }
 
 function protectedReason(userId, ip) {
@@ -61,26 +63,36 @@ function protectedReason(userId, ip) {
   return null;
 }
 
+// Real devices only ever receive REAL blocks; the demo device only ever sees demo blocks.
+// This is what guarantees a simulator action can never reach a real firewall.
 function desiredBlocks(userId, deviceId) {
-  return db.prepare(`SELECT ip FROM blocks WHERE user_id=? AND active=1 AND (expires IS NULL OR expires>?) AND (scope='fleet' OR device_id=?)`)
+  const d = db.prepare('SELECT virtual, mode FROM devices WHERE id=?').get(deviceId);
+  if (d && d.virtual) {
+    return db.prepare('SELECT ip FROM blocks WHERE user_id=? AND demo=1 AND active=1 AND (expires IS NULL OR expires>?) AND device_id=?')
+      .all(userId, now(), deviceId).map((r) => r.ip);
+  }
+  // Dry run: a monitor-only device only ever receives blocks the owner created by hand, never automatic ones.
+  const onlyManual = d && d.mode === 'monitor' ? " AND source='manual'" : '';
+  return db.prepare(`SELECT ip FROM blocks WHERE user_id=? AND demo=0 AND active=1 AND (expires IS NULL OR expires>?) AND (scope='fleet' OR device_id=?)${onlyManual}`)
     .all(userId, now(), deviceId).map((r) => r.ip);
 }
 
 function appliedCount(userId, ip) {
   let n = 0;
-  for (const st of states.values()) if (st.userId === userId && st.enforced.includes(ip)) n += 1;
+  for (const st of states.values()) if (st.userId === userId && !st.virtual && st.enforced.includes(ip)) n += 1;
   return n;
 }
 
-function addBlock(userId, { ip, reason, source = 'auto', scope = 'fleet', deviceId = null, alertId = null, ttlMin = 0 }) {
-  const existing = db.prepare('SELECT * FROM blocks WHERE user_id=? AND ip=? AND active=1').get(userId, ip);
+function addBlock(userId, { ip, reason, source = 'auto', scope = 'fleet', deviceId = null, alertId = null, ttlMin = 0, demo = 0 }) {
+  if (demo) { scope = 'device'; }
+  const existing = db.prepare('SELECT * FROM blocks WHERE user_id=? AND ip=? AND active=1 AND demo=?').get(userId, ip, demo ? 1 : 0);
   if (existing) return { block: existing, created: false };
   const t = now();
-  const r = db.prepare('INSERT INTO blocks(user_id,device_id,ip,reason,source,scope,alert_id,active,created,expires) VALUES(?,?,?,?,?,?,?,1,?,?)')
-    .run(userId, scope === 'device' ? deviceId : null, ip, reason.slice(0, 300), source, scope, alertId, t, ttlMin > 0 ? t + ttlMin * 60000 : null);
+  const r = db.prepare('INSERT INTO blocks(user_id,device_id,ip,reason,source,scope,alert_id,active,created,expires,demo) VALUES(?,?,?,?,?,?,?,1,?,?,?)')
+    .run(userId, scope === 'device' ? deviceId : null, ip, reason.slice(0, 300), source, scope, alertId, t, ttlMin > 0 ? t + ttlMin * 60000 : null, demo ? 1 : 0);
   const block = db.prepare('SELECT * FROM blocks WHERE id=?').get(Number(r.lastInsertRowid));
   hub.emit(userId, 'block', { ...block, applied: 0 });
-  log(userId, deviceId, 'OK', `Firewall rule created: block ${ip} (${source}, ${scope === 'fleet' ? 'all devices' : 'one device'})`);
+  log(userId, deviceId, 'OK', `${demo ? '[Demo] ' : ''}Firewall rule created: block ${ip} (${source}, ${scope === 'fleet' ? 'all devices' : 'one device'})`);
   return { block, created: true };
 }
 
@@ -89,10 +101,11 @@ function removeBlock(userId, id) {
   if (!b) return false;
   db.prepare('UPDATE blocks SET active=0 WHERE id=?').run(id);
   hub.emit(userId, 'unblock', { id, ip: b.ip });
-  log(userId, null, 'INFO', `Block removed: ${b.ip}`);
+  log(userId, b.device_id || null, 'INFO', `${b.demo ? '[Demo] ' : ''}Block removed: ${b.ip}`);
   return true;
 }
 
+const fresh = (d) => db.prepare('SELECT mode FROM devices WHERE id=?').get(d.id) || d; // mode may change while the agent is running
 function raise(device, a) {
   const userId = device.user_id;
   const st = stateFor(device);
@@ -106,8 +119,8 @@ function raise(device, a) {
     return last.id;
   }
   const cfg = getSettings(userId);
-  const r = db.prepare('INSERT INTO alerts(user_id,device_id,device_name,type,severity,src_ip,title,detail,status,count,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-    .run(userId, device.id, device.name, a.type, a.severity, a.src_ip || null, a.title.slice(0, 300), JSON.stringify(a.detail || {}), 'open', 1, t, t);
+  const r = db.prepare('INSERT INTO alerts(user_id,device_id,device_name,type,severity,src_ip,title,detail,status,count,created,updated,demo) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(userId, device.id, device.name, a.type, a.severity, a.src_ip || null, a.title.slice(0, 300), JSON.stringify(a.detail || {}), 'open', 1, t, t, device.virtual ? 1 : 0);
   const id = Number(r.lastInsertRowid);
   st.cooldown.set(key, { at: t, id });
   if (['critical', 'high'].includes(a.severity)) st.attackUntil = t + 10000;
@@ -116,7 +129,15 @@ function raise(device, a) {
   if (a.src_ip && a.blockable) {
     const why = protectedReason(userId, a.src_ip);
     if (why) action = `Not blocked: ${why}`;
+    else if (device.virtual) {
+      // Demo traffic: the block exists only on the simulated device and is labelled Demo. It never touches a real device.
+      const { block } = addBlock(userId, { ip: a.src_ip, reason: a.title, source: 'auto', scope: 'device', deviceId: device.id, alertId: id, ttlMin: cfg.block_ttl_min, demo: 1 });
+      action = `[Demo] Blocked ${a.src_ip} on the simulated device` + (block.expires ? ` for ${cfg.block_ttl_min} min` : '');
+    }
     else if (!cfg.auto_block) action = 'Auto-block is off. Review and block manually.';
+    else if ((fresh(device).mode || 'live') === 'monitor') {
+      action = `Dry run: would have blocked ${a.src_ip}. This device is in monitor-only mode, so nothing was blocked.`;
+    }
     else {
       const { block } = addBlock(userId, {
         ip: a.src_ip, reason: a.title, source: 'auto', scope: cfg.block_scope, deviceId: device.id, alertId: id, ttlMin: cfg.block_ttl_min,
@@ -127,9 +148,9 @@ function raise(device, a) {
   if (action) db.prepare('UPDATE alerts SET action=? WHERE id=?').run(action, id);
   const row = db.prepare('SELECT * FROM alerts WHERE id=?').get(id);
   hub.emit(userId, 'alert', publicAlert(row));
-  log(userId, device.id, a.severity === 'critical' || a.severity === 'high' ? 'CRIT' : 'WARN', `${a.title}${action ? ' | ' + action : ''}`);
+  log(userId, device.id, a.severity === 'critical' || a.severity === 'high' ? 'CRIT' : 'WARN', `${device.virtual ? '[Demo] ' : ''}${a.title}${action ? ' | ' + action : ''}`);
 
-  if (cfg.webhook_url && ['critical', 'high'].includes(a.severity)) {
+  if (cfg.webhook_url && !device.virtual && ['critical', 'high'].includes(a.severity)) {
     sendWebhook(cfg.webhook_url, {
       text: `[NetGuard AI] ${a.severity.toUpperCase()}: ${a.title} on ${device.name}${action ? '. ' + action : ''}`,
       alert: { type: a.type, severity: a.severity, src_ip: a.src_ip || null, device: device.name, action },
@@ -181,6 +202,7 @@ function ingest(device, raw, remoteAddr) {
   const cfg = getSettings(userId);
   const st = stateFor(device);
   const ts = now();
+  st.virtual = !!device.virtual;
   st.agentIp = device.virtual ? null : cleanIp(remoteAddr || '');
   st.protect = new Set(t.own_ips);
   st.enforced = t.enforced;
@@ -364,7 +386,7 @@ function sweep() {
     log(b.user_id, null, 'INFO', `Block expired: ${b.ip}`);
   }
   // offline watchdog (real agents only)
-  for (const d of db.prepare("SELECT * FROM devices WHERE virtual=0 AND status='online'").all()) {
+  for (const d of db.prepare("SELECT d.* FROM devices d JOIN users u ON u.id=d.user_id WHERE d.virtual=0 AND u.read_only=0 AND d.status='online'").all()) {
     if (t - (d.last_seen || 0) > 30000) {
       db.prepare("UPDATE devices SET status='offline' WHERE id=?").run(d.id);
       hub.emit(d.user_id, 'device', { id: d.id, status: 'offline', last_seen: d.last_seen });

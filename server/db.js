@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS logs (
   msg TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS logs_user ON logs(user_id, id DESC);
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resets (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS canaries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -102,5 +111,27 @@ CREATE TABLE IF NOT EXISTS canaries (
   created INTEGER NOT NULL
 );
 `);
+
+// ---- migrations (safe to run on every start) ----
+const addCol = (sql) => { try { db.exec(sql); } catch { /* column already exists */ } };
+addCol('ALTER TABLE alerts ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
+addCol('ALTER TABLE blocks ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
+addCol('ALTER TABLE logs ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
+// Per-device protection mode. Devices that already exist keep working exactly as before ('live');
+// devices created from now on start in 'monitor' (dry run) until the owner switches them on.
+addCol("ALTER TABLE devices ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'");
+// Simulator rows created by older versions: tag them so they stop mixing with real data.
+try {
+  db.exec(`UPDATE alerts SET demo=1 WHERE demo=0 AND device_id IN (SELECT id FROM devices WHERE virtual=1);
+           UPDATE logs   SET demo=1 WHERE demo=0 AND device_id IN (SELECT id FROM devices WHERE virtual=1);
+           UPDATE blocks SET demo=1, scope='device' WHERE demo=0 AND device_id IN (SELECT id FROM devices WHERE virtual=1);`);
+} catch { /* ignore */ }
+
+// ---- account security columns ----
+addCol('ALTER TABLE users ADD COLUMN pin_hash TEXT');
+addCol('ALTER TABLE users ADD COLUMN totp_secret TEXT');
+addCol('ALTER TABLE users ADD COLUMN totp_on INTEGER NOT NULL DEFAULT 0');
+addCol('ALTER TABLE users ADD COLUMN email_otp INTEGER NOT NULL DEFAULT 0');
+addCol('ALTER TABLE users ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0'); // sandbox demo account: can look, cannot change anything
 
 module.exports = { db, DATA_DIR };

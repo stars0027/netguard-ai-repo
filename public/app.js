@@ -55,10 +55,37 @@
 
   // ------------------------------------------------------------------ state
   const S = {
-    me: null, devices: [], alerts: [], logs: [], stats: {}, sel: null, series: [], live: {}, banner: null, bannerTimer: null,
+    me: null, devices: [], alerts: [], logs: [], stats: null, statsErr: false, alertsState: 'loading', demoAlerts: [], demoLogs: [], sel: null, series: [], live: {}, banner: null, bannerTimer: null,
     openAlert: null, stream: null, linked: false, ins: null,
   };
   let current = { refresh: null };
+
+  // ---- shared UI pieces: loading / empty / error boxes, Demo tag, one-line number formatting
+  const stateBox = (kind, msg, retry) => el('div', { class: 'state ' + kind, role: kind === 'error' ? 'alert' : 'status' },
+    kind === 'loading' ? el('i', { class: 'spin', 'aria-hidden': 'true' }) : null, el('span', {}, msg),
+    retry ? el('button', { class: 'btn sm', type: 'button', onclick: retry }, 'Try again') : null);
+  const demoTag = (txt) => el('span', { class: 'demo-tag', title: 'Simulated data. It is separate from your real devices.' }, txt || 'Demo');
+  // copy-to-clipboard code block, used for every install command
+  const codeBlock = (text) => {
+    const b = el('button', { class: 'btn sm copybtn', type: 'button', onclick: async () => {
+      try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; } catch { b.textContent = 'Select + Ctrl+C'; }
+      setTimeout(() => { b.textContent = 'Copy'; }, 1800);
+    } }, 'Copy');
+    return el('div', { class: 'codewrap' }, el('div', { class: 'codeblock' }, text), b);
+  };
+  // IP checks run in the browser first for a clear message; the server checks again (never trust the browser)
+  function ipProblem(v) {
+    v = String(v || '').trim();
+    if (!v) return 'Enter an IP address.';
+    if (/\/\d+$/.test(v)) return 'Ranges (CIDR like 10.0.0.0/24) are not accepted, because one typo could block a whole network. Enter a single IP.';
+    const v4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(v);
+    const v6 = /^[0-9a-f:]+$/i.test(v) && v.includes(':') && v.length <= 45;
+    if (!v4 && !v6) return 'That is not a valid IPv4 or IPv6 address.';
+    if (/^127\./.test(v) || v === '::1' || /^0\.0\.0\.0$/.test(v)) return v + ' is this computer (loopback). Blocking or inspecting it would only lock you out, so it is not allowed.';
+    return null;
+  }
+  const num = (k) => (S.stats && S.stats[k] != null ? S.stats[k] : '—'); // "—" = not loaded yet, never a misleading 0
+  const realDevices = () => S.devices.filter((d) => !d.virtual);
 
   // ------------------------------------------------------------------ realtime
   function closeStream() { if (S.stream) { S.stream.close(); S.stream = null; } }
@@ -81,18 +108,19 @@
     });
     es.addEventListener('telemetry_state', (e) => { const d = JSON.parse(e.data); if (S.live[d.device_id]) S.live[d.device_id].status = d.status; if (current.tick) current.tick(); });
     es.addEventListener('log', (e) => {
-      S.logs.push(JSON.parse(e.data)); if (S.logs.length > 80) S.logs.shift();
+      const l = JSON.parse(e.data), box = l.demo ? S.demoLogs : S.logs;
+      box.push(l); if (box.length > 80) box.shift();
       if (current.logTick) current.logTick();
     });
     es.addEventListener('alert', (e) => {
       const a = JSON.parse(e.data);
-      S.alerts.unshift(a);
+      (a.demo ? S.demoAlerts : S.alerts).unshift(a);
       refreshStats(); loadInsights();
       if (['critical', 'high'].includes(a.severity)) {
         alarmSound(a);
-        const blocked = /^Blocked/.test(a.action || '');
+        const blocked = /^(\[Demo\] )?Blocked/.test(a.action || '');
         S.banner = {
-          title: a.type === 'physical_anomaly' ? 'Emergency power shutdown' : blocked ? 'Attack blocked' : 'Attack detected',
+          title: (a.demo ? 'DEMO · ' : '') + (a.type === 'physical_anomaly' ? 'Emergency power shutdown' : blocked ? 'Attack blocked' : 'Attack detected'),
           sub: a.title + (a.action ? ' — ' + a.action : ''), good: blocked,
         };
         clearTimeout(S.bannerTimer);
@@ -103,12 +131,13 @@
       updateNavBadge();
     });
     for (const ev of ['alert_update', 'alert_status', 'block', 'unblock', 'device']) {
-      es.addEventListener(ev, () => { if (ev.startsWith('alert')) loadAlerts().then(() => { current.refresh && current.refresh(); updateNavBadge(); }); else { if (ev === 'device') loadDevices(); refreshStats(); loadInsights(); current.refresh && current.refresh(); } });
+      es.addEventListener(ev, () => { if (ev.startsWith('alert')) { loadAlerts().then(() => { current.refresh && current.refresh(); }); refreshStats(); } else { if (ev === 'device') loadDevices(); refreshStats(); loadInsights(); current.refresh && current.refresh(); } });
     }
   }
-  async function refreshStats() { try { S.stats = await api('GET', '/api/stats'); updateNavBadge(); if (current.tick) current.tick(); } catch { /* ignore */ } }
-  async function loadDevices() { S.devices = (await api('GET', '/api/devices')); if (!S.sel || !S.devices.find((d) => d.id === S.sel)) S.sel = S.devices[0] && S.devices[0].id; }
-  async function loadAlerts() { S.alerts = await api('GET', '/api/alerts?limit=200'); }
+  async function refreshStats() { try { S.stats = await api('GET', '/api/stats'); S.statsErr = false; } catch { S.statsErr = true; } updateNavBadge(); if (current.tick) current.tick(); }
+  async function loadDevices() { S.devices = (await api('GET', '/api/devices')); if (!S.sel || !realDevices().find((d) => d.id === S.sel)) S.sel = realDevices()[0] ? realDevices()[0].id : null; }
+  async function loadAlerts() { try { S.alerts = await api('GET', '/api/alerts?limit=200'); S.alertsState = 'ok'; } catch { S.alertsState = 'error'; } }
+  async function loadDemo() { try { [S.demoAlerts, S.demoLogs] = await Promise.all([api('GET', '/api/alerts?demo=1&limit=30'), api('GET', '/api/logs?demo=1&limit=40')]); } catch { /* demo panel just stays empty */ } }
   async function loadInsights() { try { S.ins = await api('GET', '/api/insights'); if (current.insights) current.insights(); } catch { /* ignore */ } }
   const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
   const typeLabel = (t) => TYPE_LABEL[t] || String(t).replace(/_/g, ' ');
@@ -150,42 +179,79 @@
     if (on) { try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch { /* ignore */ } alarmSound({ severity: 'high', type: 'port_scan', src_ip: '203.0.113.5', action: 'Blocked' }); }
     btn.textContent = on ? 'Sound on' : 'Sound off'; btn.setAttribute('aria-pressed', String(on));
   }
-  function updateNavBadge() { const b = document.getElementById('navBadge'); if (b) { const n = S.alerts.filter((a) => a.status === 'open').length; b.textContent = n > 99 ? '99+' : n; b.hidden = !n; } }
+  // The badge reads the SAME number as the dashboard, War Room and Report (S.stats.open_alerts, real alerts only).
+  function updateNavBadge() { const b = document.getElementById('navBadge'); if (b) { const n = S.stats ? S.stats.open_alerts : 0; b.textContent = n > 99 ? '99+' : n; b.hidden = !n; } }
   function updateLink() {
     const l = document.getElementById('linkLed'), t = document.getElementById('linkText');
     if (!l) return;
     l.className = 'led ' + (S.linked ? 'on' : 'wait');
-    const on = S.devices.filter((d) => d.status === 'online').length;
-    t.textContent = S.linked ? `Live · ${on} of ${S.devices.length} devices online` : 'Reconnecting…';
+    const real = realDevices(), on = real.filter((d) => d.status === 'online').length;
+    t.textContent = S.linked ? `Live · ${on} of ${real.length} devices online` : 'Reconnecting…';
   }
 
   // ------------------------------------------------------------------ auth screen
+  // password field with a show/hide eye button
+  function pwField(label, props) {
+    const input = el('input', { type: 'password', required: true, ...props });
+    const eye = el('button', { class: 'eye', type: 'button', 'aria-label': 'Show password', title: 'Show / hide password', onclick: () => {
+      const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.textContent = show ? '🙈' : '👁'; eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    } }, '👁');
+    const lbl = el('label', {}, el('span', { class: 'lbltxt' }, label), el('span', { class: 'pwbox' }, input, eye));
+    return { input, lbl, setLabel: (t) => { lbl.querySelector('.lbltxt').textContent = t; } };
+  }
+
   function authView() {
-    let mode = 'login';
+    let mode = 'login', ticket = null;
     const err = el('p', { class: 'err', role: 'alert' });
     const name = el('input', { type: 'text', autocomplete: 'name', maxlength: 60 });
     const email = el('input', { type: 'email', autocomplete: 'email', required: true });
-    const pw = el('input', { type: 'password', autocomplete: 'current-password', required: true, minlength: 8 });
+    const pwf = pwField('Password', { autocomplete: 'current-password', minlength: 1 }), pw = pwf.input;
+    const pin = el('input', { type: 'password', inputmode: 'numeric', pattern: '\\d{4}', maxlength: 4, autocomplete: 'off', placeholder: 'optional, 4 digits' });
+    const pinLbl = el('label', {}, '4-digit security PIN (extra protection, recommended)', pin);
+    const invite = el('input', { type: 'text', autocomplete: 'off', maxlength: 40 });
+    const inviteLbl = el('label', {}, 'Invite code (ask the owner)', invite); inviteLbl.hidden = true;
+    let signupMode = 'open';
     const nameLbl = el('label', {}, 'Name', name);
     const submit = el('button', { class: 'btn primary', type: 'submit' }, 'Sign in');
     const switcher = el('button', { class: 'btn', type: 'button' }, 'Create an account');
+    const sandbox = el('button', { class: 'btn sandbox', type: 'button', onclick: async () => {
+      sandbox.disabled = true; err.textContent = '';
+      try { await api('POST', '/api/auth/sandbox', {}); await boot(); location.hash = '#/dashboard'; } catch (x) { err.textContent = x.message; } finally { sandbox.disabled = false; }
+    } }, '⚡ Try the sandbox demo (read-only, sample data)');
     const title = el('h2', {}, 'Sign in');
+    const code = el('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, required: true });
+    const codeLbl = el('label', {}, 'Security PIN (4 digits) or authenticator / e-mail code (6 digits)', code);
+    const step1 = el('div', { class: 'form' }), step2 = el('div', { class: 'form' }); step2.hidden = true;
     function setMode(m) {
-      mode = m; nameLbl.hidden = m === 'login';
+      mode = m; nameLbl.hidden = m === 'login'; pinLbl.hidden = m === 'login'; inviteLbl.hidden = !(m === 'signup' && signupMode === 'invite');
       title.textContent = m === 'login' ? 'Sign in' : 'Create your account';
       submit.textContent = m === 'login' ? 'Sign in' : 'Create account';
       switcher.textContent = m === 'login' ? 'Create an account' : 'I already have an account';
+      pwf.setLabel(m === 'login' ? 'Password' : 'Password (8+ characters)');
       pw.autocomplete = m === 'login' ? 'current-password' : 'new-password'; err.textContent = '';
     }
     switcher.onclick = () => setMode(mode === 'login' ? 'signup' : 'login');
     const form = el('form', { class: 'form panel pad', onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; submit.disabled = true;
       try {
-        await api('POST', mode === 'login' ? '/api/auth/login' : '/api/auth/signup', { email: email.value, password: pw.value, name: name.value });
+        if (ticket) {
+          await api('POST', '/api/auth/verify', { ticket, code: code.value });
+        } else {
+          const r = await api('POST', mode === 'login' ? '/api/auth/login' : '/api/auth/signup', { email: email.value.trim().toLowerCase(), password: pw.value, name: name.value, invite: invite.value, pin: pin.value });
+          if (r.step2) { ticket = r.ticket; step1.hidden = true; step2.hidden = false; title.textContent = 'Second step'; submit.textContent = 'Verify'; switcher.hidden = true; code.focus(); return; }
+        }
         await boot(); location.hash = '#/dashboard';
       } catch (x) { err.textContent = x.message; } finally { submit.disabled = false; }
-    } }, title, nameLbl, el('label', {}, 'Email', email), el('label', {}, 'Password (8+ characters)', pw), err, el('div', { class: 'inline' }, submit, switcher));
+    } }, title,
+      step1, step2, err, el('div', { class: 'inline' }, submit, switcher),
+      el('div', { class: 'or' }, 'or'), sandbox,
+      el('p', { class: 'foot', style: 'margin-top:12px' }, el('a', { href: '/privacy.html' }, 'Privacy'), ' · ', el('a', { href: '#support', onclick: (e) => { e.preventDefault(); const t = document.getElementById('pubInfo'); if (t) t.scrollIntoView({ behavior: 'smooth' }); } }, 'Support')));
+    step1.append(nameLbl, el('label', {}, 'Email', email), pwf.lbl, pinLbl, inviteLbl);
+    step2.append(el('p', { class: 'muted' }, 'Enter the code from your security PIN, authenticator app, or e-mail to finish signing in.'), codeLbl);
+    code.required = false; email.required = true;
     setMode('login');
+    api('GET', '/api/public-config').then((c) => { signupMode = c.signup; if (c.signup === 'closed') { switcher.disabled = true; switcher.textContent = 'Sign-ups are closed'; } setMode(mode); }).catch(() => {});
+    const card = (h, ...kids) => el('div', { class: 'pubcard' }, el('h3', {}, h), ...kids);
     return el('div', { class: 'wrap' },
       el('div', { class: 'auth' },
         el('div', {},
@@ -195,24 +261,138 @@
           el('ul', {},
             el('li', {}, 'Install the agent on any server, PC or gateway'),
             el('li', {}, 'It learns normal traffic, then catches floods, port scans and brute-force logins'),
-            el('li', {}, 'Attacker IPs are blocked in the OS firewall, on all your devices'),
+            el('li', {}, 'Starts in monitor-only mode: you see what it WOULD block before it blocks anything'),
             el('li', {}, 'Live dashboard, alert history and webhook notifications'))),
-        form));
+        form),
+      el('div', { class: 'pubinfo', id: 'pubInfo' },
+        card('Try it without installing anything', el('p', {}, 'The sandbox is a read-only copy with sample devices and alerts, so you can click around safely. Inside your own account, the Attack Simulator runs a clearly labelled Demo device that never touches a real device or firewall.')),
+        card('Supported systems', el('ul', {}, el('li', {}, el('b', {}, 'Linux'), ' (Debian, Ubuntu, Fedora, Raspberry Pi OS): full support, firewall blocking with iptables, optional packet sniffer'), el('li', {}, el('b', {}, 'Windows 10 / 11 / Server'), ': monitoring and blocking with Windows Firewall (run as Administrator)'), el('li', {}, el('b', {}, 'macOS'), ': monitoring only for now'), el('li', {}, 'Needs Python 3.8+ and the psutil package'))),
+        card('How installation works', el('ol', {}, el('li', {}, 'Create an account, then open Devices and add a device'), el('li', {}, 'Copy the one-line install command and run it on that machine'), el('li', {}, 'It appears online and learns normal traffic (about a minute)'), el('li', {}, 'Keep it in monitor-only (dry run) until you trust the alerts, then enable live blocking'))),
+        card('Privacy & support', el('p', {}, 'Your devices, alerts and API keys are visible only to your account. API keys and passwords are stored hashed. You can delete your account and all its data at any time. ', el('a', { href: '/privacy.html' }, 'Read the privacy page'), '.'), el('p', {}, 'Support: open an issue at ', el('a', { href: 'https://github.com/stars0027/netguard-ai-repo/issues', target: '_blank', rel: 'noopener' }, 'github.com/stars0027/netguard-ai-repo'), '.'))));
   }
 
-  // ------------------------------------------------------------------ shell
-  const navItems = () => [['dashboard', 'Dashboard'], ['copilot', 'Copilot'], ['devices', 'Devices'], ['alerts', 'Alerts'], ['blocks', 'Blocklist'], ['tools', 'Tools'], ['warroom', 'War Room'], ['report', 'Report'], ['simulator', 'Demo'], ['settings', 'Settings']].filter(Boolean);
+  // ------------------------------------------------------------------ shell: collapsible left sidebar + slim header
+  const NAV_GROUPS = [
+    ['Operations (SOC)', [['dashboard', 'Dashboard', 'M3 12l9-8 9 8M5 10v10h14V10'], ['warroom', 'War Room', 'M12 2a10 10 0 100 20 10 10 0 000-20zM12 12l6-4'], ['alerts', 'Alerts', 'M12 3l9 16H3L12 3zM12 10v4M12 17h.01'], ['blocks', 'Blocklist', 'M12 2a10 10 0 100 20 10 10 0 000-20zM5 5l14 14']]],
+    ['Defense & fleet', [['devices', 'Devices', 'M4 5h16v10H4zM8 19h8M12 15v4'], ['copilot', 'Copilot AI', 'M4 5h16v11H9l-5 4V5z'], ['tools', 'Security Tools', 'M14 6l4 4-9 9H5v-4l9-9z'], ['report', 'Incident Report', 'M6 3h9l4 4v14H6zM9 12h7M9 16h7']]],
+    ['Simulation & system', [['simulator', 'Attack Simulator (Demo)', 'M5 3l14 9-14 9V3z'], ['settings', 'Settings', 'M12 8a4 4 0 100 8 4 4 0 000-8zM12 2v3M12 19v3M2 12h3M19 12h3']]],
+  ];
+  const navItems = () => NAV_GROUPS.flatMap(([, items]) => items.map(([k, l]) => [k, l]));
+  const sideCollapsed = () => { try { return localStorage.getItem('ng_side') === '1'; } catch { return false; } };
+
+  // ---- privacy shield: lock screen (manual button + 10 minutes without activity)
+  let lockTimer = null, lockEl = null;
+  const IDLE_MS = 10 * 60 * 1000;
+  const isLocked = () => { try { return sessionStorage.getItem('ng_locked') === '1'; } catch { return false; } };
+  function armIdle() {
+    clearTimeout(lockTimer);
+    if (S.me && !S.me.sandbox && !isLocked()) lockTimer = setTimeout(lockScreen, IDLE_MS);
+  }
+  ['mousemove', 'keydown', 'click', 'touchstart'].forEach((ev) => document.addEventListener(ev, () => { if (!lockEl) armIdle(); }, { passive: true }));
+  function lockScreen() {
+    if (lockEl || !S.me) return;
+    try { sessionStorage.setItem('ng_locked', '1'); } catch { /* ignore */ }
+    const secret = el('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Password or 4-digit PIN', 'aria-label': 'Password or PIN' });
+    const msg = el('p', { class: 'err', role: 'alert' });
+    const go = async (e) => {
+      e.preventDefault(); msg.textContent = '';
+      try { await api('POST', '/api/auth/unlock', { secret: secret.value }); unlockScreen(); } catch (x) { msg.textContent = x.message; secret.value = ''; }
+    };
+    lockEl = el('div', { class: 'lockshield', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Screen locked' },
+      el('form', { class: 'lockbox', onsubmit: go }, svg(SHIELD, 44), el('h2', {}, 'Screen locked'), el('p', { class: 'muted' }, 'Live data is hidden. Enter your password or PIN to continue.'), secret, msg, el('button', { class: 'btn primary', type: 'submit' }, 'Unlock'),
+        el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}).catch(() => {}); unlockScreen(); closeStream(); S.me = null; route(); } }, 'Sign out instead')));
+    document.body.append(lockEl); $app.classList.add('blurred'); secret.focus();
+  }
+  function unlockScreen() {
+    try { sessionStorage.removeItem('ng_locked'); } catch { /* ignore */ }
+    if (lockEl) { lockEl.remove(); lockEl = null; } $app.classList.remove('blurred'); armIdle();
+  }
+
   function shell(view, active) {
     const badge = el('span', { class: 'badge', id: 'navBadge', hidden: true });
-    return el('div', { class: 'wrap' },
-      el('header', { class: 'top' },
-        el('div', { class: 'brand' }, el('span', { class: 'mark' }, svg(SHIELD)), el('div', {}, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense'))),
-        el('nav', { class: 'nav' },
-          el('div', { class: 'tabs' }, navItems().map(([k, label]) => el('a', { href: '#/' + k, 'aria-current': k === active ? 'page' : null }, label, k === 'alerts' ? badge : null))),
-          el('button', { class: 'btn sm', type: 'button', 'aria-pressed': String(soundOn()), title: 'Play an alarm sound and show a notification for serious alerts', onclick: (e) => toggleSound(e.currentTarget) }, soundOn() ? 'Sound on' : 'Sound off'),
-          el('span', { class: 'link' }, el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
-          el('button', { class: 'btn sm', type: 'button', title: S.me.email, onclick: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } }, 'Sign out'))),
-      view);
+    const body = el('div', { class: 'wrap shell' + (sideCollapsed() ? ' collapsed' : '') });
+    const toggle = () => {
+      if (window.innerWidth < 1024) body.classList.toggle('drawer'); else { body.classList.toggle('collapsed'); try { localStorage.setItem('ng_side', body.classList.contains('collapsed') ? '1' : '0'); } catch { /* ignore */ } }
+    };
+    const search = el('input', { type: 'search', class: 'navsearch', placeholder: '🔍 Search modules…  (Ctrl+K)', 'aria-label': 'Search modules', oninput: () => {
+      const q = search.value.trim().toLowerCase();
+      for (const a of side.querySelectorAll('a.navlink')) a.hidden = !!q && !a.textContent.toLowerCase().includes(q);
+      for (const g of side.querySelectorAll('.navgroup')) g.hidden = !g.querySelector('a.navlink:not([hidden])');
+    } });
+    const side = el('aside', { class: 'side', 'aria-label': 'Main menu' },
+      el('div', { class: 'brand' }, el('span', { class: 'mark' }, svg(SHIELD)), el('div', { class: 'brandtxt' }, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense'))),
+      search,
+      NAV_GROUPS.map(([g, items]) => el('div', { class: 'navgroup' }, el('p', { class: 'navhead' }, g),
+        items.map(([k, label, icon]) => el('a', { class: 'navlink', href: '#/' + k, title: label, 'aria-current': k === active ? 'page' : null, onclick: () => body.classList.remove('drawer') }, svg(icon, 18), el('span', { class: 'navtxt' }, label), k === 'alerts' ? badge : null)))));
+    const title = (navItems().find(([k]) => k === active) || ['', 'NetGuard'])[1];
+    const header = el('header', { class: 'top2' },
+      el('button', { class: 'btn sm', type: 'button', 'aria-label': 'Toggle menu', onclick: toggle }, '☰'),
+      el('h2', { class: 'pagetitle' }, title),
+      el('div', { class: 'hdr-right' },
+        el('span', { class: 'link' }, el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
+        el('button', { class: 'btn sm', type: 'button', 'aria-pressed': String(soundOn()), title: 'Alarm sound and notification for serious alerts', onclick: (e) => toggleSound(e.currentTarget) }, soundOn() ? 'Sound on' : 'Sound off'),
+        S.me.sandbox ? null : el('button', { class: 'btn sm', type: 'button', title: 'Hide the screen until you enter your password or PIN', onclick: lockScreen }, '🔒 Lock'),
+        el('button', { class: 'btn sm kbd', type: 'button', title: 'Command palette', onclick: openPalette }, 'Ctrl+K'),
+        el('span', { class: 'userbadge', title: S.me.email }, (S.me.name || S.me.email).slice(0, 18)),
+        el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } }, 'Sign out')));
+    body.append(side, el('div', { class: 'scrim', onclick: () => body.classList.remove('drawer') }),
+      el('div', { class: 'main' }, header, S.me.sandbox ? el('div', { class: 'demo-banner', role: 'note' }, demoTag('SANDBOX'), el('span', {}, 'You are in the read-only sandbox. Everything here is sample data and nothing can be changed. Sign out and create an account to protect your own devices.')) : null, view));
+    return body;
+  }
+
+  // ------------------------------------------------------------------ alert forensics window
+  function openForensics(a, after) {
+    const d = a.detail || {};
+    const ports = d.ports || (d.top_source && d.top_source.ports) || (d.port ? [d.port] : []);
+    const peak = d.pps || d.pkts_per_s || d.peak_pps || null;
+    const ipKind = !a.src_ip ? '—' : /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|fc|fd|fe80)/i.test(a.src_ip) ? 'Private / internal address' : 'Public internet address (no location database is bundled, so no country is shown)';
+    const ro = !!(S.me && S.me.sandbox);
+    const close = () => { m.remove(); document.removeEventListener('keydown', esc, true); };
+    const esc = (e) => { if (e.key === 'Escape') close(); };
+    const act = (fn, okMsg) => async () => { try { await fn(); toast(okMsg); close(); if (after) await after(); } catch (e) { toast(e.message, true); } };
+    const row = (k, v) => el('div', { class: 'frow' }, el('span', { class: 'k' }, k), el('span', { class: 'v' }, v == null || v === '' ? '—' : v));
+    const m = el('div', { class: 'palette', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Alert details', onclick: (e) => { if (e.target === m) close(); } },
+      el('div', { class: 'palette-box forensic' },
+        el('div', { class: 'head' }, el('h2', {}, el('span', { class: 'sev ' + a.severity }, a.severity), ' ' + typeLabel(a.type)), el('button', { class: 'btn sm', onclick: close }, 'Close')),
+        el('p', {}, a.title),
+        row('Time', fmtDT(a.created)), row('Attack type', typeLabel(a.type)), row('Source IP', a.src_ip), row('Origin', ipKind),
+        row('Target device', a.device_name), row('Targeted ports', ports.length ? ports.join(', ') : null), row('Peak packet rate', peak != null ? Number(peak).toLocaleString() + ' pkt/s' : null),
+        row('Status', a.status), row('What NetGuard did', a.action),
+        el('p', { class: 'k', style: 'margin-top:10px' }, 'Raw telemetry'), el('pre', {}, JSON.stringify(d, null, 2)),
+        ro ? el('p', { class: 'muted' }, 'Sandbox is read-only: actions are turned off.') : null,
+        el('div', { class: 'inline', style: 'margin-top:12px' },
+          a.src_ip ? el('button', { class: 'btn danger', disabled: ro || /^(\[Demo\] )?Blocked/.test(a.action || ''), onclick: act(() => api('POST', `/api/alerts/${a.id}/block`, {}), 'Blocked ' + a.src_ip) }, 'Block IP now') : null,
+          a.src_ip ? el('button', { class: 'btn', disabled: ro, onclick: act(() => api('POST', '/api/allowlist', { ip: a.src_ip, note: 'Added from alert' }), a.src_ip + ' added to the allowlist') }, 'Add IP to allowlist') : null,
+          el('button', { class: 'btn', onclick: () => { S.copilotSeed = `Investigate the ${typeLabel(a.type)} alert${a.src_ip ? ' from ' + a.src_ip : ''} on ${a.device_name || 'my device'}. Is it dangerous and what should I do?`; close(); location.hash = '#/copilot'; } }, 'Investigate in Copilot'),
+          a.status === 'open' ? el('button', { class: 'btn', disabled: ro, onclick: act(() => api('PATCH', `/api/alerts/${a.id}`, { status: 'ack' }), 'Acknowledged') }, 'Acknowledge') : null,
+          a.status !== 'resolved' ? el('button', { class: 'btn', disabled: ro, onclick: act(() => api('PATCH', `/api/alerts/${a.id}`, { status: 'resolved' }), 'Resolved') }, 'Resolve') : null)));
+    document.body.append(m); document.addEventListener('keydown', esc, true);
+  }
+
+  // ------------------------------------------------------------------ protection status strip
+  // One clear answer to "will NetGuard block anything right now?" plus the three things people look for: allowlist, expiry, undo.
+  function protectionBar() {
+    const box = el('section', { class: 'panel pad protbar', 'aria-label': 'Protection status' });
+    function paint() {
+      const p = S.stats && S.stats.protection;
+      if (!p) { box.replaceChildren(S.statsErr ? stateBox('error', 'Could not load protection status.', refreshStats) : stateBox('loading', 'Checking protection status…')); return; }
+      const r = S.stats.real, mins = p.block_ttl_min;
+      const modeTxt = p.effective === 'off' ? 'Automatic blocking is OFF. NetGuard only raises alerts.'
+        : p.effective === 'dry-run' ? 'Automatic blocking is ON, but every device is monitor-only (dry run). Nothing is blocked yet; alerts show what would be blocked.'
+        : `Automatic blocking is ON for ${r.live_devices} live device${r.live_devices === 1 ? '' : 's'}` + (r.dry_run_devices ? ` (${r.dry_run_devices} more in dry run)` : '') + '.';
+      box.dataset.mode = p.effective;
+      box.replaceChildren(
+        el('div', { class: 'pb-row' },
+          el('span', { class: 'pb-pill', 'data-on': String(p.auto_block) }, 'Auto-block: ' + (p.auto_block ? 'ON' : 'OFF')),
+          el('span', { class: 'pb-pill', 'data-on': String(p.lockdown) }, 'Lockdown: ' + (p.lockdown ? 'ON' : 'OFF')),
+          el('span', { class: 'pb-pill' }, 'Scope: ' + (p.block_scope === 'fleet' ? 'all devices' : 'attacked device only')),
+          el('span', { class: 'pb-pill' }, 'Blocks expire: ' + (mins ? mins + ' min' : 'never'))),
+        el('p', { class: 'pb-msg' }, modeTxt),
+        el('p', { class: 'pb-help' }, 'Safety tools: ', el('a', { href: '#/blocks' }, 'Allowlist (IPs never blocked)'), ' · ', el('a', { href: '#/blocks' }, 'Unblock / roll back'), ' · ', el('a', { href: '#/settings' }, 'Change expiry or turn off')));
+    }
+    paint();
+    const prev = current.tick; // repaint whenever the shared stats refresh
+    return { node: box, paint };
   }
 
   // ------------------------------------------------------------------ chart (hand drawn, no library)
@@ -253,6 +433,7 @@
     const chartPanel = el('section', { class: 'panel pad' });
     const devSel = el('select', { 'aria-label': 'Device', onchange: async (e) => { S.sel = Number(e.target.value); await loadSeries(); current.tick(); } });
     const logs = el('div', { class: 'logs', id: 'logs' });
+    const statsNote = el('div', {}), prot = protectionBar();
     chartPanel.append(el('div', { class: 'head' }, el('h2', {}, 'Network traffic'), el('span', { class: 'meta' }, devSel, 'packets/s')), el('div', { class: 'chartbox' }, canvas));
 
     async function loadSeries() {
@@ -270,8 +451,10 @@
       const hot = status === 'under_attack' || status === 'safe_mode';
       set('kPps', live ? live.pps.toLocaleString() : '—', hot ? 'crit' : 'accent');
       set('kStatus', status === 'learning' && live ? `Learning ${Math.round(live.learning * 100)}%` : label, hot ? 'crit' : status === 'nominal' ? 'ok' : 'warn');
-      set('kBlocked', String(S.stats.blocked_total ?? 0), 'accent');
-      set('kOpen', String(S.stats.open_alerts ?? 0), (S.stats.open_alerts || 0) > 0 ? 'warn' : 'ok');
+      set('kBlocked', String(num('blocked_total')), 'accent');
+      set('kOpen', String(num('open_alerts')), S.stats && S.stats.open_alerts > 0 ? 'warn' : 'ok');
+      statsNote.replaceChildren(...(S.statsErr ? [stateBox('error', 'Live counts could not be refreshed. The numbers shown may be out of date.', refreshStats)] : []));
+      prot.paint();
       banner.hidden = !S.banner; banner.className = 'banner' + (S.banner && S.banner.good ? ' good' : '');
       if (S.banner) { document.getElementById('bT').textContent = S.banner.title; document.getElementById('bS').textContent = S.banner.sub; }
       document.getElementById('glow').className = S.banner && !S.banner.good ? 'on' : '';
@@ -282,18 +465,20 @@
     current = { tick, logTick: paintLogs, refresh: null, cleanup: () => { document.getElementById('glow').className = ''; } };
     (async () => {
       await Promise.all([loadDevices(), loadAlerts(), refreshStats()]);
-      devSel.replaceChildren(...S.devices.map((d) => el('option', { value: d.id, selected: d.id === S.sel }, d.name)));
+      loaded = true;
+      devSel.replaceChildren(...realDevices().map((d) => el('option', { value: d.id, selected: d.id === S.sel }, d.name)));
       if (!S.logs.length) S.logs = await api('GET', '/api/logs?limit=60');
-      await loadSeries(); paintLogs(); tick();
+      await loadSeries(); paintLogs(); current.tick();
     })();
     window.addEventListener('resize', tick);
     const prevCleanup = current.cleanup; current.cleanup = () => { prevCleanup(); window.removeEventListener('resize', tick); };
+    let loaded = false; const loadingBox = stateBox('loading', 'Loading your devices and live counts…');
     const empty = el('div', { class: 'panel pad', hidden: true, id: 'emptyState' },
       el('h2', {}, 'Protect your first device'),
       el('p', { class: 'muted', style: 'margin:8px 0 14px;max-width:70ch' }, 'NetGuard protects machines that run its small agent. Add a server, PC or gateway, run one command on it, and it starts learning its normal traffic, detecting attacks and blocking attackers automatically.'),
       el('ol', { class: 'muted', style: 'margin:0 0 16px;padding-left:20px;display:grid;gap:4px' }, el('li', {}, 'Click Add device and give it a name'), el('li', {}, 'Copy the install command and run it on that machine'), el('li', {}, 'Watch it appear here within seconds')),
-      el('a', { class: 'btn primary', href: '#/devices', style: 'text-decoration:none;display:inline-flex;align-items:center' }, 'Add your first device'));
-    const showEmpty = () => { empty.hidden = S.devices.length > 0; kpis.hidden = chartRow.hidden = S.devices.length === 0; };
+      el('div', { class: 'inline' }, el('a', { class: 'btn primary', href: '#/devices', style: 'text-decoration:none;display:inline-flex;align-items:center' }, 'Add your first device'), el('a', { class: 'btn', href: '#/simulator', style: 'text-decoration:none;display:inline-flex;align-items:center' }, 'Try the Demo (no real device)')));
+    const showEmpty = () => { const n = realDevices().length; empty.hidden = n > 0 || !loaded; kpis.hidden = chartRow.hidden = n === 0; loadingBox.hidden = loaded; };
     const prevTick = tick; current.tick = () => { showEmpty(); prevTick(); };
     const chartRow = el('div', { class: 'split' }, chartPanel, el('section', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Live logs'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'streaming')), logs));
     // ---- next-level insights: security score, 24h timeline, attack types, top attackers
@@ -383,7 +568,7 @@
         el('div', { class: 'head', style: 'margin-top:14px' }, el('h2', {}, 'Attack types · 7 days')), typesBox),
       el('section', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Top attackers'), el('span', { class: 'meta' }, '7 days')), atkBox));
     return el('section', { class: 'view grid' },
-      empty, banner, kpis,
+      loadingBox, prot.node, statsNote, empty, banner, kpis,
       chartRow, radarRow, insightsRow,
       el('p', { class: 'foot' }, 'Dashed line = anomaly threshold learned from this device\'s own normal traffic'));
   }
@@ -394,32 +579,47 @@
     const keyArea = el('div', {});
     const nameIn = el('input', { type: 'text', maxlength: 60, placeholder: 'e.g. Web server, Plant gateway' });
     const origin = location.origin;
-    function installBox(key) {
+    function installBox(key, isNew = true) {
+      const k = key || 'YOUR_API_KEY';
       const cmd = (extra) => `curl -fsSL ${origin}/agent/netguard_agent.py -o netguard_agent.py\npip install psutil\n${extra}`;
+      const shown = el('div', { class: 'codeblock', id: 'keyShown' }, key ? key.slice(0, 6) + '•'.repeat(24) + key.slice(-3) : 'Keys are stored hashed, so an old key cannot be shown again. Use "New key" to make one.');
+      let vis = false;
+      const reveal = key ? el('button', { class: 'btn sm', type: 'button', onclick: (e) => { vis = !vis; shown.textContent = vis ? key : key.slice(0, 6) + '•'.repeat(24) + key.slice(-3); e.currentTarget.textContent = vis ? 'Hide key' : 'Reveal key'; } }, 'Reveal key') : null;
+      const copyKey = key ? codeBlock(key).querySelector('button') : null;
+      if (copyKey) copyKey.onclick = async () => { try { await navigator.clipboard.writeText(key); copyKey.textContent = 'Copied'; } catch { copyKey.textContent = 'Reveal then copy'; } setTimeout(() => { copyKey.textContent = 'Copy key'; }, 1800); };
+      if (copyKey) copyKey.textContent = 'Copy key';
       return el('div', { class: 'keybox' },
-        el('strong', {}, 'Copy your API key now. It is shown only once.'),
-        el('div', { class: 'codeblock' }, key),
-        el('p', {}, el('strong', {}, 'Easiest (Linux server or PC): one command.'), ' It installs the agent as a service that starts on boot and blocks attackers automatically.'),
-        el('div', { class: 'codeblock' }, `curl -fsSL ${origin}/install.sh | sudo NETGUARD_KEY=${key} bash`),
-        el('p', { class: 'muted' }, 'Or install by hand. Linux / macOS. Run on the machine you want to protect. Add --enforce to let NetGuard block attackers in the firewall (needs root); --sniff enables the packet sniffer (Linux, root).'),
-        el('div', { class: 'codeblock' }, cmd(`sudo python3 netguard_agent.py --server ${origin} --key ${key} --enforce --sniff`)),
+        el('strong', {}, key && isNew ? 'Copy your API key now. It is hidden by default and shown only once.' : 'Install commands (replace YOUR_API_KEY with the key you saved, or press "New key")'),
+        el('div', { class: 'codewrap' }, shown, el('div', { class: 'inline' }, reveal, copyKey)),
+        el('p', { class: 'muted', 'data-tone': 'ok' }, 'New devices start in monitor-only (dry run) mode: NetGuard reports what it WOULD block but blocks nothing. Switch the device to live blocking on this page when you are ready.'),
+        el('p', {}, el('strong', {}, 'Linux server or PC (easiest): one command.'), ' It installs the agent as a service that starts on boot.'),
+        codeBlock(`curl -fsSL ${origin}/install.sh | sudo NETGUARD_KEY=${k} bash`),
+        el('p', { class: 'muted' }, 'Linux / macOS by hand. Add --enforce to let NetGuard block attackers in the firewall (needs root); --sniff enables the packet sniffer (Linux, root).'),
+        codeBlock(cmd(`sudo python3 netguard_agent.py --server ${origin} --key ${k} --enforce --sniff`)),
         el('p', { class: 'muted' }, 'Windows (PowerShell as Administrator):'),
-        el('div', { class: 'codeblock' }, `Invoke-WebRequest ${origin}/agent/netguard_agent.py -OutFile netguard_agent.py\npip install psutil\npython netguard_agent.py --server ${origin} --key ${key} --enforce`),
+        codeBlock(`Invoke-WebRequest ${origin}/agent/netguard_agent.py -OutFile netguard_agent.py\npip install psutil\npython netguard_agent.py --server ${origin} --key ${k} --enforce`),
         origin.startsWith('http://') && !/localhost|127\.0\.0\.1/.test(origin) ? el('p', { class: 'muted', 'data-tone': 'warn' }, 'This server is on plain http. Put it behind https before using it on the internet.') : null);
     }
     function paint() {
-      if (!S.devices.length) { list.replaceChildren(el('p', { class: 'empty' }, 'No devices yet.')); return; }
+      if (!S.devices.length) { list.replaceChildren(stateBox('empty', 'No devices yet. Add one above.')); return; }
       list.replaceChildren(...S.devices.map((d) => {
         const live = S.live[d.id] || {};
         return el('div', { class: 'devrow' },
-          el('div', {}, el('div', { class: 'n' }, el('i', { class: 'led ' + (d.status === 'online' ? 'on' : d.status === 'offline' ? 'off' : 'wait') }), d.name),
+          el('div', {}, el('div', { class: 'n' }, el('i', { class: 'led ' + (d.status === 'online' ? 'on' : d.status === 'offline' ? 'off' : 'wait') }), d.name, d.virtual ? demoTag('Demo · simulated') : null),
             el('div', { class: 'muted mono' }, `${d.hostname || 'waiting for agent'} · ${d.os || ''}`)),
-          el('div', {}, el('div', { class: 'k' }, 'Status'), d.status + (d.enforce ? ' · enforcing' : d.status === 'online' ? ' · monitor-only' : '')),
+          el('div', {}, el('div', { class: 'k' }, 'Status'), d.status + (d.virtual ? '' : d.mode === 'monitor' ? ' · monitor-only (dry run)' : d.enforce ? ' · live blocking' : d.status === 'online' ? ' · agent monitor-only' : '')),
           el('div', {}, el('div', { class: 'k' }, 'Traffic'), live.pps != null ? live.pps.toLocaleString() + ' pkt/s' : '—'),
           el('div', {}, el('div', { class: 'k' }, 'Last seen'), ago(d.last_seen)),
           el('div', { class: 'inline' }, [
+            d.virtual ? null : el('button', { class: 'btn sm' + (d.mode === 'monitor' ? ' primary' : ''), onclick: async () => {
+              const toLive = d.mode === 'monitor';
+              if (toLive && !confirm(`Turn on LIVE blocking for ${d.name}?\n\nNetGuard will block attacker IPs in this device's firewall (only if its agent runs with --enforce). Your own devices, gateway and allowlist are never blocked. You can switch back any time.`)) return;
+              try { await api('PATCH', `/api/devices/${d.id}/mode`, toLive ? { mode: 'live', confirm: true } : { mode: 'monitor' }); await loadDevices(); await refreshStats(); paint(); toast(toLive ? 'Live blocking on' : 'Back to monitor-only'); } catch (e) { toast(e.message, true); }
+            } }, d.mode === 'monitor' ? 'Enable live blocking' : 'Back to monitor-only'),
+            d.virtual ? null : el('button', { class: 'btn sm', onclick: () => keyArea.replaceChildren(installBox(null, false)) }, 'Install commands'),
+            d.virtual ? null : el('button', { class: 'btn sm', onclick: async () => { const n = prompt('New name for this device', d.name); if (n == null || !n.trim()) return; try { await api('PATCH', `/api/devices/${d.id}`, { name: n }); await loadDevices(); paint(); toast('Renamed'); } catch (e) { toast(e.message, true); } } }, 'Rename'),
             el('button', { class: 'btn sm', onclick: async () => { if (!confirm('Rotate the API key? The agent stops working until you update it.')) return; const r = await api('POST', `/api/devices/${d.id}/rotate-key`, {}); keyArea.replaceChildren(installBox(r.api_key)); } }, 'New key'),
-            el('button', { class: 'btn sm danger', onclick: async () => { if (!confirm(`Remove ${d.name}?`)) return; await api('DELETE', `/api/devices/${d.id}`); await loadDevices(); paint(); } }, 'Remove')]));
+            el('button', { class: 'btn sm danger', onclick: async () => { if (!confirm(`Delete ${d.name}? Its history stays in alerts, but the agent will stop being accepted.`)) return; await api('DELETE', `/api/devices/${d.id}`); await loadDevices(); paint(); } }, 'Delete')]));
       }));
     }
     current = { refresh: paint, tick: paint };
@@ -441,24 +641,26 @@
       ['all', 'open', 'ack', 'resolved'].map((v) => el('option', { value: v }, v === 'all' ? 'All alerts' : v === 'ack' ? 'Acknowledged' : v[0].toUpperCase() + v.slice(1))));
     const act = async (fn) => { try { await fn(); await loadAlerts(); await refreshStats(); paint(); } catch (e) { toast(e.message, true); } };
     function paint() {
+      const cell = (node) => { body.replaceChildren(el('tr', {}, el('td', { colspan: 7 }, node))); };
+      if (S.alertsState === 'loading') return cell(stateBox('loading', 'Loading alerts…'));
+      if (S.alertsState === 'error') return cell(stateBox('error', 'Could not load alerts.', () => { S.alertsState = 'loading'; paint(); loadAlerts().then(paint); }));
       const rows = S.alerts.filter((a) => filter === 'all' || a.status === filter);
-      if (!rows.length) { body.replaceChildren(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'No alerts. That means nothing suspicious has been seen.'))); return; }
+      if (!rows.length) return cell(stateBox('empty', S.alerts.length ? 'No alerts match this filter.' : 'No real alerts. Nothing suspicious has been seen on your devices. (Simulator alerts are on the Demo page, not here.)'));
       body.replaceChildren(...rows.flatMap((a) => {
-        const tr = el('tr', { style: 'cursor:pointer', onclick: (e) => { if (e.target.closest('button')) return; S.openAlert = S.openAlert === a.id ? null : a.id; paint(); } },
+        const tr = el('tr', { style: 'cursor:pointer', title: 'Click for full details', onclick: (e) => { if (e.target.closest('button')) return; openForensics(a, async () => { await loadAlerts(); await refreshStats(); paint(); }); } },
           el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, el('span', { class: 'sev ' + a.severity }, a.severity)),
           el('td', {}, a.title, a.count > 1 ? el('span', { class: 'pill', style: 'margin-left:8px' }, '×' + a.count) : null, a.action ? el('div', { class: 'muted' }, a.action) : null),
           el('td', { class: 'mono' }, a.src_ip || '—'), el('td', {}, a.device_name || '—'), el('td', {}, a.status),
           el('td', {}, el('div', { class: 'inline' },
             a.status === 'open' ? el('button', { class: 'btn sm', onclick: () => act(() => api('PATCH', `/api/alerts/${a.id}`, { status: 'ack' })) }, 'Ack') : null,
             a.status !== 'resolved' ? el('button', { class: 'btn sm', onclick: () => act(() => api('PATCH', `/api/alerts/${a.id}`, { status: 'resolved' })) }, 'Resolve') : null,
-            a.src_ip && !/^Blocked/.test(a.action || '') ? el('button', { class: 'btn sm danger', onclick: () => act(async () => { await api('POST', `/api/alerts/${a.id}/block`, {}); toast('Blocked ' + a.src_ip); }) }, 'Block IP') : null)));
+            a.src_ip && !/^(\[Demo\] )?Blocked/.test(a.action || '') ? el('button', { class: 'btn sm danger', onclick: () => act(async () => { await api('POST', `/api/alerts/${a.id}/block`, {}); toast('Blocked ' + a.src_ip); }) }, 'Block IP') : null)));
         const out = [tr];
-        if (S.openAlert === a.id) out.push(el('tr', { class: 'open-detail' }, el('td', { colspan: 7 }, el('pre', {}, `type: ${a.type}\n` + JSON.stringify(a.detail, null, 2)))));
         return out;
       }));
     }
     current = { refresh: paint, tick: null };
-    loadAlerts().then(paint);
+    S.alertsState = 'loading'; paint(); loadAlerts().then(paint);
     return el('section', { class: 'view panel pad' },
       el('div', { class: 'head' }, el('h2', {}, 'Alerts'), el('span', { class: 'meta' }, el('a', { class: 'btn sm', href: '/api/alerts.csv', download: 'netguard-alerts.csv', style: 'text-decoration:none;display:inline-flex;align-items:center' }, 'Export CSV'), sel)),
       el('div', { class: 'tablewrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['Time', 'Severity', 'What happened', 'Source', 'Device', 'Status', ''].map((h) => el('th', {}, h)))), body)));
@@ -472,7 +674,7 @@
     const aip = el('input', { type: 'text', placeholder: '198.51.100.7' }), anote = el('input', { type: 'text', placeholder: 'Note (optional)', maxlength: 100 });
     async function paint() {
       const [b, a] = await Promise.all([api('GET', '/api/blocks'), api('GET', '/api/allowlist')]);
-      info.textContent = `${b.enforcing_devices} device${b.enforcing_devices === 1 ? '' : 's'} currently enforcing blocks in their firewall. Devices in monitor-only mode raise alerts but do not block.`;
+      info.textContent = `${b.enforcing_devices} device${b.enforcing_devices === 1 ? '' : 's'} currently enforcing blocks in their firewall. Devices in monitor-only (dry run) mode raise alerts but do not block. This list shows real blocks only.`;
       blocksBody.replaceChildren(...(b.blocks.length ? b.blocks.map((x) => el('tr', {},
         el('td', { class: 'mono' }, x.ip), el('td', {}, x.reason), el('td', {}, x.source), el('td', {}, x.applied + ' / ' + b.enforcing_devices),
         el('td', {}, fmtDT(x.created)), el('td', {}, left(x.expires)),
@@ -482,8 +684,14 @@
     }
     current = { refresh: paint, tick: null };
     paint();
-    const add = (path, body, clear) => async () => { try { await api('POST', path, body()); clear.forEach((i) => { i.value = ''; }); paint(); } catch (e) { toast(e.message, true); } };
+    const add = (path, body, clear) => async () => { try { const b = body(); const pr = b.ip !== undefined ? ipProblem(b.ip) : null; if (pr) { toast(pr, true); return; } await api('POST', path, b); clear.forEach((i) => { i.value = ''; }); paint(); } catch (e) { toast(e.message, true); } };
     return el('section', { class: 'view grid' },
+      el('div', { class: 'panel pad rollback' }, el('div', { class: 'head' }, el('h2', {}, 'Made a mistake? How to undo')),
+        el('ol', { class: 'muted', style: 'margin:0;padding-left:20px;display:grid;gap:4px' },
+          el('li', {}, 'Click Unblock next to the IP below. It leaves the firewall of every device within seconds.'),
+          el('li', {}, 'Add the IP to the Allowlist so it can never be blocked or flagged again.'),
+          el('li', {}, 'Blocks expire on their own (see the Expires column). Change the time in Settings.'),
+          el('li', {}, 'To stop all automatic blocking: Settings, untick "Block attackers automatically", Save. Or stop the agent on the device.'))),
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Active blocks')), info,
         el('div', { class: 'inline', style: 'margin:12px 0' }, el('label', {}, 'IP address', ip), el('label', {}, 'Reason', reason),
           el('button', { class: 'btn primary', onclick: add('/api/blocks', () => ({ ip: ip.value, reason: reason.value }), [ip, reason]) }, 'Block IP')),
@@ -503,6 +711,7 @@
       const num = (k, label, hint) => el('label', {}, label + (hint ? ` (${hint})` : ''), el('input', { type: 'number', name: k, value: s[k], min: 0 }));
       f.append(
         el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'auto_block', checked: s.auto_block }), 'Block attackers automatically'),
+        el('p', { class: 'muted small' }, 'Off by default for new accounts. Turning it on asks you to confirm. New devices stay in monitor-only (dry run) mode until you enable live blocking on the Devices page.'),
         el('label', {}, 'Block scope', el('select', { name: 'block_scope' }, [['fleet', 'All my devices'], ['device', 'Only the attacked device']].map(([v, t]) => el('option', { value: v, selected: s.block_scope === v }, t)))),
         num('block_ttl_min', 'Unblock after', 'minutes, 0 = never'),
         el('label', {}, 'Sensitivity', el('select', { name: 'sensitivity' }, [['low', 'Low (fewer alerts)'], ['medium', 'Medium'], ['high', 'High (more alerts)']].map(([v, t]) => el('option', { value: v, selected: s.sensitivity === v }, t)))),
@@ -520,7 +729,17 @@
       const fd = new FormData(f), body = {};
       for (const [k, v] of fd.entries()) body[k] = ['webhook_url', 'block_scope', 'sensitivity'].includes(k) ? v : Number(v);
       body.auto_block = f.elements.auto_block.checked;
-      try { await api('PUT', '/api/settings', body); toast('Settings saved'); } catch (x) { msg.textContent = x.message; }
+      try {
+        try { await api('PUT', '/api/settings', body); }
+        catch (x) {
+          if (!/^Confirmation needed/.test(x.message)) throw x;
+          const lock = body.auto_block && body.sensitivity === 'high';
+          if (!confirm((lock ? 'LOCKDOWN: maximum sensitivity with automatic blocking.\n\n' : 'Turn on automatic blocking' + (body.block_scope === 'fleet' ? ' on ALL your devices' : '') + '?\n\n') +
+            'NetGuard will block attacker IPs by itself, for ' + (body.block_ttl_min ? body.block_ttl_min + ' minutes' : 'ever') + ' each. A wrong block can cut off a real visitor. Your own devices, gateway and allowlist are never blocked, and you can undo any block on the Blocklist page.\n\nDevices still in monitor-only (dry run) mode will not block until you switch them to live.')) { msg.textContent = 'Not saved. Automatic blocking stays as it was.'; return; }
+          await api('PUT', '/api/settings', { ...body, confirm_broad: true });
+        }
+        toast('Settings saved'); refreshStats();
+      } catch (x) { msg.textContent = x.message; }
     };
     const cur = el('input', { type: 'password', autocomplete: 'current-password' }), nw = el('input', { type: 'password', autocomplete: 'new-password', minlength: 8 });
     pwForm.append(el('label', {}, 'Current password', cur), el('label', {}, 'New password', nw), pmsg, el('button', { class: 'btn', type: 'submit' }, 'Change password'));
@@ -535,9 +754,11 @@
   async function getLockdown() { try { const c = await api('GET', '/api/settings'); return !!c.auto_block && c.sensitivity === 'high'; } catch { return false; } }
   async function setLockdown(on) {
     const cur = await api('GET', '/api/settings');
-    if (on) { try { localStorage.setItem('ng_prev_sens', cur.sensitivity); } catch { /* ignore */ } await api('PUT', '/api/settings', { auto_block: true, sensitivity: 'high' }); toast('Lockdown ON: maximum sensitivity, automatic blocking'); }
+    if (on) {
+      if (!confirm('Turn on LOCKDOWN?\n\nMaximum sensitivity plus automatic blocking' + (cur.block_scope === 'fleet' ? ' on all your devices' : '') + '. It may block legitimate visitors. Allowlisted IPs and your own devices are never blocked. You can turn it off any time, and every block can be undone on the Blocklist page.')) return;
+      try { localStorage.setItem('ng_prev_sens', cur.sensitivity); } catch { /* ignore */ } await api('PUT', '/api/settings', { auto_block: true, sensitivity: 'high', confirm_broad: true }); toast('Lockdown ON: maximum sensitivity, automatic blocking'); }
     else { let prev = 'medium'; try { prev = localStorage.getItem('ng_prev_sens') || 'medium'; } catch { /* ignore */ } await api('PUT', '/api/settings', { sensitivity: prev === 'high' ? 'medium' : prev }); toast('Lockdown off: sensitivity restored'); }
-    loadInsights();
+    loadInsights(); refreshStats();
   }
   const THEMES = { lemon: ['#FFF21A', 'rgba(255,242,26,.13)', '#171717'], lavender: ['#A66BFF', 'rgba(166,107,255,.18)', '#171717'], amber: ['#C8792C', 'rgba(200,121,44,.2)', '#171717'], ice: ['#5ee7ff', 'rgba(94,231,255,.14)', '#04141c'] };
   function applyTheme(name) {
@@ -584,10 +805,18 @@
     const ui = () => UI[getLang() === 'ta' ? 'ta' : 'en'];
     const log = el('div', { class: 'chat', 'aria-live': 'polite' });
     const input = el('input', { type: 'text', maxlength: 400, 'aria-label': 'Ask Copilot' });
+    if (S.copilotSeed) { input.value = S.copilotSeed; S.copilotSeed = null; }
     const chipsBox = el('div', { class: 'chips' }), askBtn = el('button', { class: 'btn primary', type: 'submit' }), labelTxt = el('span', {});
     const badge = el('span', { class: 'aibadge' }, '…');
+    const basicCard = el('div', { class: 'basic-card', hidden: true, role: 'note' },
+      el('strong', {}, 'Copilot is in Basic mode'),
+      el('p', {}, 'The full AI is switched off because the server has no AI key (GEMINI_API_KEY) yet. Basic mode still works, using your own live data and fixed rules.'),
+      el('div', { class: 'two' },
+        el('div', {}, el('b', {}, 'Works now'), el('ul', {}, ['Security score and what is hurting it', 'Open alerts, top attackers, blocked IPs', 'Explaining attack types in plain words', 'IP checks, English and Tamil, voice in and out', 'Block an IP or lockdown (you confirm first)'].map((t) => el('li', {}, t)))),
+        el('div', {}, el('b', {}, 'Needs the key'), el('ul', {}, ['Free-form questions outside the built-in topics', 'Follow-up questions that remember the conversation', 'Detailed step-by-step fixes for your setup'].map((t) => el('li', {}, t))))),
+      el('p', { class: 'muted small' }, 'The key lives only on the server (a Render environment variable). It is never sent to your browser.'));
     const history = []; let readAloud = true, convo = false, rec = null, busy = false;
-    api('GET', '/api/copilot/status').then((r) => { badge.textContent = r.ai ? 'AI: ' + (r.ai === 'gemini' ? 'Gemini' : 'Claude') : 'Basic mode'; badge.dataset.ai = r.ai ? '1' : '0'; badge.title = r.ai ? 'Real AI is on' : 'Add GEMINI_API_KEY on the server to turn on the full AI'; }).catch(() => {});
+    api('GET', '/api/copilot/status').then((r) => { badge.textContent = r.ai ? 'AI: ' + (r.ai === 'gemini' ? 'Gemini' : 'Claude') : 'Basic mode'; badge.dataset.ai = r.ai ? '1' : '0'; badge.title = r.ai ? 'Real AI is on' : 'Add GEMINI_API_KEY on the server to turn on the full AI'; basicCard.hidden = !!r.ai; }).catch(() => { badge.textContent = 'Status unknown'; });
     // speak() resolves when the voice finishes, so the hands-free loop knows when to listen again
     const speak = (text, lang) => new Promise((resolve) => {
       try {
@@ -686,6 +915,7 @@
     const ipIn = el('input', { type: 'text', placeholder: '203.0.113.50', 'aria-label': 'IP address' });
     const qIn = el('input', { type: 'text', placeholder: 'e.g. 10.0.4.23, brute, flood, blocked', 'aria-label': 'Search' });
     async function inspect(ip) {
+      const pr = ipProblem(ip); if (pr) { out.replaceChildren(el('p', { class: 'err' }, pr)); return; }
       out.replaceChildren(el('p', { class: 'muted' }, 'Checking…'));
       try {
         const r = await api('GET', '/api/ip/' + encodeURIComponent(ip.trim()));
@@ -723,25 +953,38 @@
   function reportView() {
     const body = el('div', { class: 'report-body' });
     current = {};
-    (async () => {
-      await Promise.all([loadAlerts(), loadInsights()]);
-      const I = S.ins || { timeline: [], attackers: [], by_type: [], factors: [] }, total = I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0);
+    const draw = () => {
+      const I = S.ins;
+      if (S.alertsState === 'error' || !I || !S.stats) {
+        body.replaceChildren(stateBox('error', 'The report could not be built because live data failed to load.', load)); return;
+      }
+      const R = S.stats.real, total = I.timeline.reduce((a, b) => a + b.critical + b.high + b.other, 0);
+      if (!R.devices && !R.alerts_total) {
+        body.replaceChildren(stateBox('empty', 'Nothing to report yet. Add a real device on the Devices page. The report fills in as soon as your device sends data. Demo and simulator activity is never included here.'),
+          el('a', { class: 'btn primary noprint', href: '#/devices', style: 'text-decoration:none;display:inline-flex;margin-top:12px' }, 'Add a device')); return;
+      }
       const mx = Math.max(1, ...I.timeline.map((b) => b.critical + b.high + b.other));
       body.replaceChildren(
+        el('p', { class: 'muted' }, `Real data only. ${R.devices} device${R.devices === 1 ? '' : 's'} (${R.online} online), ${R.alerts_total} alert${R.alerts_total === 1 ? '' : 's'} on record.`),
         el('div', { class: 'rep-grid' },
           el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Security score'), el('b', {}, I.score == null ? '—' : I.score + '/100')),
-          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Alerts, 24 h'), el('b', {}, total)),
-          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Attackers, 7 d'), el('b', {}, I.attackers.length)),
-          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Currently blocked'), el('b', {}, S.stats.active_blocks ?? 0))),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Alerts, 24 h'), el('b', {}, R.alerts_24h)),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Open alerts'), el('b', {}, R.open_alerts)),
+          el('div', { class: 'rep-stat' }, el('span', { class: 'k' }, 'Currently blocked'), el('b', {}, R.active_blocks))),
         el('h3', { class: 'sub' }, 'Alerts per hour, last 24 hours'),
-        el('div', { class: 'rep-bars' }, I.timeline.map((b) => { const n = b.critical + b.high + b.other; return el('i', { style: `height:${Math.max(3, (n / mx) * 100)}%`, title: n + ' alerts', class: b.critical ? 'c' : b.high ? 'h' : '' }); })),
+        total ? el('div', { class: 'rep-bars' }, I.timeline.map((b) => { const n = b.critical + b.high + b.other; return el('i', { style: `height:${Math.max(3, (n / mx) * 100)}%`, title: n + ' alerts', class: b.critical ? 'c' : b.high ? 'h' : '' }); })) : stateBox('empty', 'No alerts in the last 24 hours.'),
         el('h3', { class: 'sub' }, 'Top attackers'),
-        I.attackers.length ? el('table', {}, el('thead', {}, el('tr', {}, ['IP', 'Attack types', 'Alerts', 'Last seen', 'Status'].map((h) => el('th', {}, h)))), el('tbody', {}, I.attackers.map((a) => el('tr', {}, el('td', { class: 'mono' }, a.ip), el('td', {}, a.types.map(typeLabel).join(', ')), el('td', {}, a.alerts), el('td', {}, ago(a.last)), el('td', {}, a.blocked ? 'Blocked' : 'Not blocked'))))) : el('p', { class: 'muted' }, 'No attackers in the last 7 days.'),
+        I.attackers.length ? el('table', {}, el('thead', {}, el('tr', {}, ['IP', 'Attack types', 'Alerts', 'Last seen', 'Status'].map((h) => el('th', {}, h)))), el('tbody', {}, I.attackers.map((a) => el('tr', {}, el('td', { class: 'mono' }, a.ip), el('td', {}, a.types.map(typeLabel).join(', ')), el('td', {}, a.alerts), el('td', {}, ago(a.last)), el('td', {}, a.blocked ? 'Blocked' : 'Not blocked'))))) : stateBox('empty', 'No attackers seen in the last 7 days.'),
         el('h3', { class: 'sub' }, 'Recent alerts'),
-        S.alerts.length ? el('table', {}, el('thead', {}, el('tr', {}, ['Time', 'Severity', 'What happened', 'Source', 'Action'].map((h) => el('th', {}, h)))), el('tbody', {}, S.alerts.slice(0, 20).map((a) => el('tr', {}, el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, a.severity), el('td', {}, a.title), el('td', { class: 'mono' }, a.src_ip || '—'), el('td', {}, a.action || '—'))))) : el('p', { class: 'muted' }, 'No alerts recorded.'),
+        S.alerts.length ? el('table', {}, el('thead', {}, el('tr', {}, ['Time', 'Severity', 'What happened', 'Source', 'Action'].map((h) => el('th', {}, h)))), el('tbody', {}, S.alerts.slice(0, 20).map((a) => el('tr', {}, el('td', { class: 'mono' }, fmtDT(a.created)), el('td', {}, a.severity), el('td', {}, a.title), el('td', { class: 'mono' }, a.src_ip || '—'), el('td', {}, a.action || '—'))))) : stateBox('empty', 'No alerts recorded.'),
         el('h3', { class: 'sub' }, 'Recommendations'),
         el('ul', { class: 'recs' }, (I.factors.length ? I.factors : [{ fix: 'No action needed. Keep reviewing alerts weekly.' }]).map((f) => el('li', {}, f.fix))));
-    })();
+    };
+    function load() {
+      body.replaceChildren(stateBox('loading', 'Building your report…'));
+      Promise.all([loadAlerts(), refreshStats(), api('GET', '/api/insights').then((i) => { S.ins = i; }).catch(() => { S.ins = null; })]).then(draw);
+    }
+    load();
     return el('section', { class: 'view panel pad report' },
       el('div', { class: 'head' }, el('h2', {}, 'Incident report'), el('span', { class: 'meta noprint' }, el('button', { class: 'btn primary sm', type: 'button', onclick: () => window.print() }, 'Print / save as PDF'))),
       el('p', { class: 'muted', style: 'margin-bottom:14px' }, 'Generated ' + new Date().toLocaleString() + ' for ' + S.me.email), body);
@@ -780,8 +1023,8 @@
     requestAnimationFrame(draw);
     function paint() {
       const set = (id, v) => { const n = document.getElementById(id); if (n) n.textContent = v; };
-      const I = S.ins; set('wScore', I && I.score != null ? I.score : '—'); set('wBlocked', S.stats.active_blocks ?? 0); set('wOpen', S.stats.open_alerts ?? 0);
-      set('wAtk', I ? I.attackers.filter((a) => !a.blocked).length : 0);
+      const I = S.ins; set('wScore', I && I.score != null ? I.score : '—'); set('wBlocked', num('active_blocks')); set('wOpen', num('open_alerts'));
+      set('wAtk', I ? I.attackers.filter((a) => !a.blocked).length : '—');
       clock.textContent = new Date().toLocaleTimeString([], { hour12: false });
       feed.replaceChildren(...S.logs.slice(-14).reverse().map((l) => el('div', { class: 'row ' + l.level }, el('span', { class: 't' }, fmtTime(l.ts)), el('span', { class: 'l' }, l.level), el('span', { class: 'm' }, l.msg))));
       document.getElementById('glow').className = S.banner && !S.banner.good ? 'on' : '';
@@ -791,7 +1034,7 @@
     (async () => { await Promise.all([loadAlerts(), refreshStats(), loadInsights()]); if (!S.logs.length) S.logs = await api('GET', '/api/logs?limit=30'); paint(); })();
     const fs = el('button', { class: 'btn sm', type: 'button', onclick: () => { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); } }, 'Full screen');
     return el('section', { class: 'view wr' },
-      el('div', { class: 'wr-top' }, el('h2', {}, 'NetGuard war room'), el('span', { class: 'meta' }, clock, fs)),
+      el('div', { class: 'wr-top' }, el('h2', {}, 'NetGuard war room ', el('small', { class: 'muted' }, 'real data only')), el('span', { class: 'meta' }, clock, fs)),
       el('div', { class: 'wr-main' }, el('div', { class: 'panel wr-radar' }, radar), el('div', { class: 'wr-side' }, big('wScore', 'Security score'), big('wAtk', 'Active attackers'), big('wBlocked', 'Blocked now'), big('wOpen', 'Open alerts'))),
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Live feed'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'streaming')), feed));
   }
@@ -855,13 +1098,21 @@
     const fire = (type, label) => async () => {
       try {
         const r = await api('POST', '/api/sim/attack', { type });
-        status.textContent = `${fmtTime(Date.now())} ${label}${r.attacker_ip ? ' from ' + r.attacker_ip : ''}. ${r.listening} dashboard${r.listening === 1 ? '' : 's'} listening. Watch the Dashboard.`;
+        status.textContent = `${fmtTime(Date.now())} ${label}${r.attacker_ip ? ' from ' + r.attacker_ip : ''}. ${r.listening} dashboard${r.listening === 1 ? '' : 's'} listening. Results appear below (Demo only).`;
         try { navigator.vibrate && navigator.vibrate(type === 'cyber' ? [60, 40, 60] : 140); } catch { /* ignore */ }
       } catch (e) { toast(e.message, true); }
     };
     const btn = (cls, title, sub, type, label) => el('button', { class: 'big ' + cls, type: 'button', onclick: fire(type, label) }, el('span', { class: 'lbl' }, title), el('span', { class: 'sub' }, sub));
+    const feed = el('div', { class: 'logs' }), dAlerts = el('div', {});
+    function paintDemo() {
+      dAlerts.replaceChildren(...(S.demoAlerts.length ? S.demoAlerts.slice(0, 6).map((a) => el('div', { class: 'row' }, el('span', { class: 't' }, fmtTime(a.created)), el('span', { class: 'sev ' + a.severity }, a.severity), el('span', { class: 'm' }, demoTag(), ' ', a.title, a.action ? ' | ' + a.action : ''))) : [stateBox('empty', 'No demo alerts yet. Press one of the buttons above.')]));
+      feed.replaceChildren(...S.demoLogs.slice(-12).reverse().map((l) => el('div', { class: 'row ' + l.level }, el('span', { class: 't' }, fmtTime(l.ts)), el('span', { class: 'l' }, l.level), el('span', { class: 'm' }, l.msg))));
+    }
+    current = { tick: paintDemo, refresh: paintDemo, logTick: paintDemo };
+    loadDemo().then(paintDemo);
     return el('section', { class: 'view grid' },
-      el('div', {}, el('h2', {}, 'Attack simulator'),
+      el('div', { class: 'demo-banner', role: 'note' }, demoTag('DEMO MODE'), el('span', {}, 'Everything on this page is simulated. It runs on a separate Demo device with fake traffic. It never reaches your real devices, your real alerts, or any firewall. Demo results are kept out of your dashboard counts and report.')),
+      el('div', {}, el('h2', {}, 'Attack simulator ', demoTag()),
         el('p', { class: 'muted', style: 'max-width:70ch;margin-top:6px' }, 'Sends synthetic traffic from a fake attacker into the demo device. It goes through the exact same detection engine, alerting and auto-block logic as a real agent. Open the Dashboard on another screen to watch, or use this page on your phone.')),
       el('div', { class: 'remote' },
         btn('red', 'Launch cyber attack', 'Floods the demo network with 2,000 packets per second', 'cyber', 'Flood attack launched'),
@@ -869,12 +1120,62 @@
         btn('blue', 'Port scan', 'One host probes dozens of ports', 'scan', 'Port scan launched'),
         btn('violet', 'Login brute force', 'Repeated failed logins from one address', 'brute', 'Brute force launched')),
       el('div', { class: 'panel pad' }, status,
-        el('p', { class: 'muted', style: 'margin-top:8px' }, 'If auto-block is on (Settings), the attacker is blocked within seconds and the simulated attack stops, like it would on a real machine.'),
-        el('button', { class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await api('POST', '/api/sim/reset', {}); toast('Simulation stopped'); } }, 'Stop simulation')));
+        el('p', { class: 'muted', style: 'margin-top:8px' }, 'The Demo device always blocks its fake attacker on its own, so you can see the full flow. This never changes your Settings and never blocks anything on a real device.'),
+        el('button', { class: 'btn sm', style: 'margin-top:10px', onclick: async () => { await api('POST', '/api/sim/reset', {}); toast('Simulation stopped'); } }, 'Stop simulation')),
+      el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Demo alerts '), demoTag()), dAlerts, el('div', { class: 'head', style: 'margin-top:14px' }, el('h2', {}, 'Demo log '), demoTag()), feed));
+  }
+
+  // ------------------------------------------------------------------ my account: delete everything
+  // ---- 2-step verification settings: security PIN, authenticator app, e-mail code
+  function securityPanel() {
+    const box = el('div', { class: 'panel pad' }), msg = el('p', { class: 'err', role: 'alert' });
+    const pw = el('input', { type: 'password', autocomplete: 'current-password', 'aria-label': 'Your password' });
+    const pin = el('input', { type: 'password', inputmode: 'numeric', maxlength: 4, 'aria-label': 'New 4-digit PIN', placeholder: '4 digits' });
+    const secretBox = el('div', {});
+    async function paint() {
+      let st; try { st = await api('GET', '/api/security'); } catch { box.replaceChildren(stateBox('error', 'Could not load security settings.', paint)); return; }
+      const run = (fn, ok) => async () => { msg.textContent = ''; try { await fn(); toast(ok); await paint(); } catch (x) { msg.textContent = x.message; } };
+      box.replaceChildren(el('div', { class: 'head' }, el('h2', {}, 'Privacy & 2-step verification')),
+        el('p', { class: 'muted' }, 'After your password, NetGuard can ask for a second step. Turn on at least one. The same PIN also unlocks the screen after inactivity.'),
+        el('label', {}, 'Your password (needed for every change below)', pw),
+        el('div', { class: 'secrow' }, el('b', {}, '4-digit security PIN: ' + (st.pin ? 'ON' : 'off')),
+          el('div', { class: 'inline' }, pin, el('button', { class: 'btn sm primary', onclick: run(() => api('POST', '/api/security/pin', { password: pw.value, pin: pin.value }), 'PIN saved') }, st.pin ? 'Change PIN' : 'Set PIN'),
+            st.pin ? el('button', { class: 'btn sm danger', onclick: run(() => api('DELETE', '/api/security/pin', { password: pw.value }), 'PIN removed') }, 'Remove') : null)),
+        el('div', { class: 'secrow' }, el('b', {}, 'Authenticator app (6-digit code): ' + (st.totp ? 'ON' : 'off')),
+          el('div', { class: 'inline' },
+            el('button', { class: 'btn sm primary', onclick: async () => {
+              msg.textContent = '';
+              try {
+                const r = await api('POST', '/api/security/totp/setup', { password: pw.value });
+                const c = el('input', { type: 'text', inputmode: 'numeric', maxlength: 6, placeholder: '6-digit code', 'aria-label': 'Code from your authenticator' });
+                secretBox.replaceChildren(el('p', { class: 'muted' }, 'In Google Authenticator, Microsoft Authenticator or Authy choose "Enter a setup key" and type this key (account: NetGuard AI, time-based):'), codeBlock(r.secret.replace(/(.{4})/g, '$1 ').trim()),
+                  el('p', { class: 'muted' }, 'On a phone you can also tap: ', el('a', { href: r.uri }, 'open in authenticator app'), '. Then type the code it shows to finish.'),
+                  el('div', { class: 'inline' }, c, el('button', { class: 'btn sm primary', onclick: run(() => api('POST', '/api/security/totp/enable', { code: c.value }), 'Authenticator turned on') }, 'Confirm')));
+              } catch (x) { msg.textContent = x.message; }
+            } }, st.totp ? 'Set up again' : 'Set up'),
+            st.totp ? el('button', { class: 'btn sm danger', onclick: run(() => api('DELETE', '/api/security/totp', { password: pw.value }), 'Authenticator removed') }, 'Remove') : null), secretBox),
+        el('div', { class: 'secrow' }, el('b', {}, 'E-mail code: ' + (st.email ? 'ON' : 'off')),
+          st.email_available ? el('button', { class: 'btn sm', onclick: run(() => api('POST', '/api/security/email', { password: pw.value, on: !st.email }), st.email ? 'E-mail code off' : 'E-mail code on') }, st.email ? 'Turn off' : 'Turn on')
+            : el('span', { class: 'muted' }, 'Not available: the site owner has not set SMTP_EMAIL and SMTP_PASSWORD on the server.')),
+        msg);
+    }
+    box.replaceChildren(stateBox('loading', 'Loading security settings…')); paint();
+    return box;
+  }
+  function accountPanel() {
+    const pw = el('input', { type: 'password', autocomplete: 'current-password', 'aria-label': 'Your password' }), err = el('p', { class: 'err', role: 'alert' });
+    return el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'My account')),
+      el('p', { class: 'muted', style: 'margin-bottom:10px' }, 'Deleting your account permanently removes your devices, alerts, blocks and logs. This cannot be undone. ', el('a', { href: '/privacy.html' }, 'Privacy')),
+      el('form', { class: 'inline', onsubmit: async (e) => {
+        e.preventDefault(); err.textContent = '';
+        if (!confirm('Delete your account and ALL its data forever?')) return;
+        try { await api('DELETE', '/api/me', { password: pw.value }); closeStream(); S.me = null; location.hash = ''; route(); toast('Account deleted'); } catch (x) { err.textContent = x.message; }
+      } }, el('label', {}, 'Type your password to confirm', pw), el('button', { class: 'btn danger', type: 'submit' }, 'Delete my account')), err);
   }
 
   // ------------------------------------------------------------------ router
-  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: blocksView, simulator: simulatorView, settings: settingsView };
+  function withProtection(v) { const pb = protectionBar(); v.prepend(pb.node); const t = current.tick; current.tick = () => { pb.paint(); if (t) t(); }; return v; }
+  const VIEWS = { warroom: warRoomView, copilot: copilotView, tools: toolsView, report: reportView, dashboard: dashboardView, devices: devicesView, alerts: alertsView, blocks: () => withProtection(blocksView()), simulator: simulatorView, settings: () => { const v = withProtection(settingsView()); v.append(securityPanel()); if (!S.me.sandbox) v.append(accountPanel()); return v; } };
   function route() {
     if (current.cleanup) { current.cleanup(); }
     current = { refresh: null };
@@ -887,6 +1188,7 @@
   async function boot() {
     try { S.me = await api('GET', '/api/me'); } catch { S.me = null; }
     if (S.me) {
+      if (isLocked()) setTimeout(lockScreen, 0); else armIdle();
       await Promise.all([loadDevices(), loadAlerts(), refreshStats()]);
       S.logs = []; openStream();
     }

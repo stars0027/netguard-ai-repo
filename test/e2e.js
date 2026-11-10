@@ -49,6 +49,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let alerts = (await call('GET', '/api/alerts')).data;
   ok(alerts.length === 0, 'no alerts on normal traffic');
 
+  console.log('safe defaults / dry run');
+  ok(created.data.device.mode === 'monitor', 'new device starts in monitor-only (dry run) mode');
+  const cfg0 = (await call('GET', '/api/settings')).data;
+  ok(cfg0.auto_block === false, 'new account: automatic blocking is OFF by default');
+  ok((await call('PUT', '/api/settings', { auto_block: true })).status === 409, 'enabling broad auto-blocking needs confirmation');
+  ok((await call('GET', '/api/settings')).data.auto_block === false, 'setting unchanged after refused request');
+  ok((await call('PUT', '/api/settings', { auto_block: true, confirm_broad: true })).status === 200, 'enabling with confirmation works');
+  r = await tel({ pps: 5000, sources: [{ ip: '198.51.100.60', pkts: 4800, syns: 4000, ports: [80] }] });
+  ok(!r.data.blocks.includes('198.51.100.60'), 'dry run: flood does NOT block on a monitor-only device');
+  alerts = (await call('GET', '/api/alerts')).data;
+  ok(alerts.some((a) => a.src_ip === '198.51.100.60' && /^Dry run: would have blocked/.test(a.action)), 'dry run alert says what would have been blocked');
+  ok((await call('PATCH', `/api/devices/${created.data.device.id}/mode`, { mode: 'live' })).status === 409, 'switching a device to live needs confirmation');
+  ok((await call('PATCH', `/api/devices/${created.data.device.id}/mode`, { mode: 'live', confirm: true })).data.mode === 'live', 'device switched to live after confirmation');
+  let sm = (await call('GET', '/api/stats')).data;
+  ok(sm.devices === 1 && sm.open_alerts === alerts.filter((x) => x.status === 'open').length && sm.protection.effective === 'live', 'summary counts only real data and reports live protection');
+
   r = await tel({ pps: 5000, sources: [{ ip: '198.51.100.23', pkts: 4800, syns: 4000, ports: [80] }] });
   ok(r.data.blocks.includes('198.51.100.23'), 'flood from one source -> IP in agent block list immediately');
   alerts = (await call('GET', '/api/alerts')).data;
@@ -98,7 +114,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('live stream');
   const login = await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'correct horse 9' });
   ok(login.status === 200, 'login works');
-  await call('PUT', '/api/settings', { auto_block: true }); // was switched off in the management test
+  await call('PUT', '/api/settings', { auto_block: true, confirm_broad: true }); // was switched off in the management test
   ok((await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'wrong' })).status === 401, 'wrong password rejected');
   const stream = await new Promise((resolve) => {
     const events = [];
@@ -117,7 +133,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const simRes = await call('POST', '/api/sim/attack', { type: 'cyber' });
   ok(simRes.status === 200 && simRes.data.attacker_ip, 'demo attack button starts a simulated attack');
   await sleep(3500);
-  ok((await call('GET', '/api/alerts')).data.some((a) => a.device_name && /Demo/.test(a.device_name) && /^Blocked/.test(a.action || '')), 'demo attack is detected and auto-blocked by the real engine');
+  const before = (await call('GET', '/api/stats')).data;
+  const realAlerts = (await call('GET', '/api/alerts?status=open')).data;
+  ok(before.open_alerts === realAlerts.length, 'nav badge / dashboard / alert list agree (one source of truth)');
+  const demoAlerts = (await call('GET', '/api/alerts?demo=1')).data;
+  ok(demoAlerts.some((a) => a.demo === 1 && /Demo/.test(a.device_name) && /^\[Demo\] Blocked/.test(a.action || '')), 'demo attack is detected and blocked on the DEMO device only (labelled Demo)');
+  ok(!(await call('GET', '/api/alerts')).data.some((a) => a.demo), 'real alert list never contains demo alerts');
+  ok((await call('GET', '/api/blocks')).data.blocks.every((x) => !x.demo), 'real block list never contains demo blocks');
+  const demoIp = simRes.data.attacker_ip;
+  r = await tel({ pps: 130 });
+  ok(!r.data.blocks.includes(demoIp), 'demo block never reaches a real device firewall list');
+  ok((await call('POST', `/api/alerts/${demoAlerts[0].id}/block`, {})).status === 409, 'a demo alert cannot create a real block');
+  ok(before.demo.alerts_total > 0 && before.demo.active_blocks >= 0 && before.devices === 1, 'summary keeps demo counts separate from real counts');
+
   const cpBoth = (await call('POST', '/api/copilot', { question: 'am i safe', lang: 'both' })).data;
   ok(/[\u0B80-\u0BFF]/.test(cpBoth.answer) && /security|score|devices/i.test(cpBoth.answer), 'copilot can answer in English and Tamil together');
 
@@ -179,6 +207,50 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const fb = (await call('POST', '/api/copilot', { question: 'am i safe', lang: 'en' })).data;
   ok(fb.ai === null && /score|devices/i.test(fb.answer), 'if the AI service fails, the basic assistant still answers');
   delete process.env.GEMINI_API_KEY;
+
+  console.log('account + privacy');
+  await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'correct horse 9' });
+  await call('POST', '/api/auth/signup', { email: 'c@b.co', password: 'cee password 1' });
+  ok((await call('DELETE', '/api/me', { password: 'nope' })).status === 403, 'deleting own account needs the right password');
+  ok((await call('DELETE', '/api/me', { password: 'cee password 1' })).status === 200 && (await call('GET', '/api/me')).status === 401, 'user can delete own account and all data');
+  ok((await fetch(base + '/privacy.html')).status === 200, 'privacy page is served');
+
+  console.log('2-step verification, sandbox, lockout');
+  const tw = require('../server/twofa');
+  await call('POST', '/api/auth/signup', { email: 'p@b.co', password: 'pin user pass 1', pin: '4821' });
+  const lg = await call('POST', '/api/auth/login', { email: 'p@b.co', password: 'pin user pass 1' });
+  ok(lg.data.step2 === true && lg.data.methods.includes('pin') && !lg.headers.get('set-cookie'), 'account with a PIN gets a second step and NO session yet');
+  cookie = '';
+  ok((await call('POST', '/api/auth/verify', { ticket: lg.data.ticket, code: '0000' })).status === 401, 'wrong PIN rejected');
+  const v = await call('POST', '/api/auth/verify', { ticket: lg.data.ticket, code: '4821' });
+  ok(v.status === 200 && (await call('GET', '/api/me')).data.email === 'p@b.co', 'correct PIN completes sign-in');
+  ok((await call('POST', '/api/auth/unlock', { secret: '4821' })).status === 200 && (await call('POST', '/api/auth/unlock', { secret: '1111' })).status === 401, 'lock screen accepts PIN, rejects wrong one');
+  const su = await call('POST', '/api/security/totp/setup', { password: 'pin user pass 1' });
+  ok(su.data.secret && /^otpauth:\/\/totp\//.test(su.data.uri), 'authenticator setup returns secret + otpauth URI');
+  ok((await call('POST', '/api/security/totp/enable', { code: '000000' })).status === 400, 'authenticator refuses a wrong code');
+  ok((await call('POST', '/api/security/totp/enable', { code: tw.hotp(su.data.secret, Math.floor(Date.now() / 30000)) })).status === 200, 'authenticator enabled with a valid code');
+  cookie = '';
+  const lg2 = await call('POST', '/api/auth/login', { email: 'p@b.co', password: 'pin user pass 1' });
+  const v2 = await call('POST', '/api/auth/verify', { ticket: lg2.data.ticket, code: tw.hotp(su.data.secret, Math.floor(Date.now() / 30000)) });
+  ok(v2.status === 200, 'sign-in works with the 6-digit authenticator code');
+  const rn = await call('POST', '/api/devices', { name: 'Old name' });
+  ok((await call('PATCH', `/api/devices/${rn.data.device.id}`, { name: 'Renamed' })).data.name === 'Renamed', 'device can be renamed');
+  cookie = '';
+  const sb = await call('POST', '/api/auth/sandbox', {});
+  ok(sb.status === 200, 'sandbox sign-in works');
+  ok((await call('GET', '/api/me')).data.sandbox === true, 'session is marked sandbox');
+  const sd = (await call('GET', '/api/devices')).data;
+  ok(sd.length === 2 && sd.some((d) => d.name === 'Prod-Edge-Gateway-01'), 'sandbox has its 2 sample devices');
+  ok((await call('GET', '/api/alerts')).data.length === 4, 'sandbox has 4 sample alerts');
+  ok((await call('POST', '/api/devices', { name: 'x' })).status === 403 && (await call('PUT', '/api/settings', { auto_block: false })).status === 403 && (await call('POST', '/api/blocks', { ip: '8.8.8.8' })).status === 403, 'sandbox is read-only');
+  cookie = '';
+  ok((await call('GET', '/api/devices')).status === 401, 'private accounts never see sandbox data and vice versa (needs sign-in)');
+  const nf = await call('POST', '/api/auth/login', { email: 'nobody@x.co', password: 'whatever pass' });
+  ok(nf.status === 401 && /Account not found/.test(nf.data.error), 'unknown e-mail gets a clear message');
+  const wp = await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'wrong wrong' });
+  ok(wp.status === 401 && /Incorrect password/.test(wp.data.error), 'wrong password gets a clear message');
+  let last; for (let i = 0; i < 5; i++) last = await call('POST', '/api/auth/login', { email: 'a@b.co', password: 'wrong wrong' });
+  ok(last.status === 429 && /locked out/.test(last.data.error), '5 wrong passwords lock the address out for 5 minutes');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();

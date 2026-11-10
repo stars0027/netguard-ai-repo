@@ -108,3 +108,8 @@ Set one environment variable on the server and the Copilot becomes a real AI tha
 - `AI_DAILY_LIMIT` caps questions per user per day (default 150).
 Only a summary of your alerts, devices and attacker IPs is sent to the AI. Passwords, emails and API keys are never sent.
 Without a key the built-in rule-based assistant is used.
+
+
+## v13 notes
+- Optional Render environment variables: `GEMINI_API_KEY` (real AI Copilot, server-side only), `ADMIN_EMAIL` + `ADMIN_PASSWORD` (+ optional `ADMIN_PIN`) to create your owner account on every start, `SMTP_EMAIL` + `SMTP_PASSWORD` (Gmail app password) to enable e-mail sign-in codes.
+- Sandbox login: demo@netguard.ai / NetGuardDemo2026! (read-only, sample data, or use the "Try the sandbox" button).

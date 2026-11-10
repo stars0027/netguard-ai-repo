@@ -48,9 +48,9 @@ const clearCookieHeader = () => `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; 
 function userFromRequest(req) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (!token) return null;
-  const row = db.prepare(`SELECT u.id,u.email,u.name,u.settings,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(sha256(token));
+  const row = db.prepare(`SELECT u.id,u.email,u.name,u.settings,u.read_only,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(sha256(token));
   if (!row || row.expires < now()) return null;
-  return { id: row.id, email: row.email, name: row.name, settings: json(row.settings), token };
+  return { id: row.id, email: row.email, name: row.name, settings: json(row.settings), read_only: !!row.read_only, token };
 }
 
 // ---- device API keys: "ng_<random>", only sha256 stored ----

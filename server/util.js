@@ -6,6 +6,7 @@ const now = () => Date.now();
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const randToken = (bytes = 32) => crypto.randomBytes(bytes).toString('base64url');
 const clamp = (v, lo, hi, dflt = lo) => {
+  if (v === null || v === undefined || v === '') return dflt; // a missing value must use the default, not become 0
   const n = Number(v);
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
 };
