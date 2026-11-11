@@ -22,7 +22,7 @@ const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP !== '0';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.py': 'text/x-python; charset=utf-8' };
 
 const HEADERS = {
-  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://*.basemaps.cartocdn.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
   'Cross-Origin-Opener-Policy': 'same-origin', 'Permissions-Policy': 'geolocation=(), camera=(), microphone=()',
 };
@@ -92,11 +92,24 @@ function deleteUser(id) {
   db.prepare('DELETE FROM users WHERE id=?').run(id);
 }
 try { db.exec('ALTER TABLE users ADD COLUMN last_login INTEGER'); } catch { /* column already exists */ }
-route('GET', '/api/public-config', 'public', async (req, res) => send(res, 200, { signup: ALLOW_SIGNUP ? signupMode() : 'closed' }));
+route('GET', '/api/public-config', 'public', async (req, res) => send(res, 200, { signup: ALLOW_SIGNUP ? signupMode() : 'closed', email_verify: mailer.mailReady() }));
 
 // ------------------------------------------------------------------ auth routes
 const twofa = require('./twofa');
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
+const mailer = require('./mailer'), emailcheck = require('./emailcheck'), geo = require('./geo');
+// e-mail verification: a 6-digit code must be typed before a new account is activated (only when a mail service is configured)
+const vtickets = new Map(); // ticket -> { uid, code, exp, tries }
+setInterval(() => { for (const [k, t] of vtickets) if (t.exp < now()) vtickets.delete(k); }, 60000).unref();
+async function sendVerifyCode(uid, email) {
+  if (!auth.rateLimit('vsend:' + uid, 5, 3600000)) throw bad('Too many codes requested. Try again in an hour.', 429);
+  const ticket = crypto.randomBytes(24).toString('base64url'), code = String(crypto.randomInt(0, 1e6)).padStart(6, '0');
+  vtickets.set(ticket, { uid, code, exp: now() + 15 * 60000, tries: 0 });
+  try { await mailer.send(email, 'Your NetGuard AI verification code', `Your NetGuard AI verification code is ${code}. It expires in 15 minutes. If you did not create this account, ignore this e-mail.`); }
+  catch (e) { vtickets.delete(ticket); console.error('mail failed:', e.message); throw bad('We could not send the verification e-mail. Try again in a minute.', 502); }
+  return ticket;
+}
+setInterval(() => { try { db.prepare('DELETE FROM users WHERE email_verified=0 AND created<?').run(now() - 86400000); } catch { /* ignore */ } }, 3600000).unref();
 route('POST', '/api/auth/signup', 'public', async (req, res, ctx) => {
   const mode = signupMode();
   if (!ALLOW_SIGNUP || mode === 'closed') throw bad('Sign-ups are closed. Ask the site owner for access.', 403);
@@ -114,9 +127,16 @@ route('POST', '/api/auth/signup', 'public', async (req, res, ctx) => {
   const pin = ctx.body.pin == null || ctx.body.pin === '' ? null : String(ctx.body.pin);
   if (pin !== null && !/^\d{4}$/.test(pin)) throw bad('Security PIN must be exactly 4 digits');
   if (em === DEMO_EMAIL) throw bad('This email is reserved', 409);
-  const r = db.prepare('INSERT INTO users(email,name,pass_hash,pin_hash,created) VALUES(?,?,?,?,?)')
-    .run(em, String(name || em.split('@')[0]).slice(0, 60), auth.hashPassword(password), pin ? auth.hashPassword(pin) : null, now());
+  const chk = await emailcheck.check(em);
+  if (!chk.ok) throw bad(chk.reason, 400);
+  const needVerify = mailer.mailReady();
+  const r = db.prepare('INSERT INTO users(email,name,pass_hash,pin_hash,created,email_verified) VALUES(?,?,?,?,?,?)')
+    .run(em, String(name || em.split('@')[0]).slice(0, 60), auth.hashPassword(password), pin ? auth.hashPassword(pin) : null, now(), needVerify ? 0 : 1);
   const uid = Number(r.lastInsertRowid);
+  if (needVerify) {
+    try { return send(res, 201, { verify_email: true, ticket: await sendVerifyCode(uid, em), email: em }); }
+    catch (e) { db.prepare('DELETE FROM users WHERE id=?').run(uid); throw e; }
+  }
   engine.log(uid, null, 'INFO', 'Welcome to NetGuard AI. Add your first device to start protecting it.');
   const token = auth.createSession(uid);
   send(res, 201, { ok: true }, { 'Set-Cookie': auth.cookieHeader(token, SECURE) });
@@ -144,6 +164,7 @@ route('POST', '/api/auth/login', 'public', async (req, res, ctx) => {
   if (!u) { auth.verifyPassword('x', 's1$AAAAAAAAAAAAAAAAAAAAAA==$' + 'A'.repeat(86)); noteFail(ctx.ip); throw bad("Account not found for this email. Click 'CREATE AN ACCOUNT' below.", 401); }
   if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) { noteFail(ctx.ip); throw bad('Incorrect password. Click the eye icon to verify your typing.', 401); }
   fails.delete(ctx.ip);
+  if (!u.email_verified) return send(res, 200, { verify_email: true, ticket: await sendVerifyCode(u.id, u.email), email: u.email });
   const methods = methodsOf(u);
   if (!methods.length || u.read_only) return startSession(res, u.id);
   const ticket = crypto.randomBytes(24).toString('base64url');
@@ -151,6 +172,18 @@ route('POST', '/api/auth/login', 'public', async (req, res, ctx) => {
   tickets.set(ticket, t);
   if (methods.includes('email')) { t.otp = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); twofa.sendMail(u.email, 'Your NetGuard AI sign-in code', `Your NetGuard AI code is ${t.otp}. It expires in 5 minutes. If this was not you, change your password.`).catch(() => { t.otp = null; }); }
   send(res, 200, { step2: true, ticket, methods });
+});
+
+route('POST', '/api/auth/verify-email', 'public', async (req, res, ctx) => {
+  const key = String(ctx.body.ticket || ''), t = vtickets.get(key);
+  if (!t || t.exp < now()) throw bad('That code expired. Sign in again to get a new one.', 401);
+  if (++t.tries > 5) { vtickets.delete(key); throw bad('Too many wrong codes. Sign in again to get a new one.', 429); }
+  const code = String(ctx.body.code || '').replace(/\s/g, '');
+  if (!/^\d{6}$/.test(code) || !crypto.timingSafeEqual(Buffer.from(t.code), Buffer.from(code))) throw bad('Wrong code. Check your e-mail and try again.', 401);
+  vtickets.delete(key);
+  db.prepare('UPDATE users SET email_verified=1 WHERE id=?').run(t.uid);
+  engine.log(t.uid, null, 'INFO', 'Welcome to NetGuard AI. Add your first device to start protecting it.');
+  startSession(res, t.uid);
 });
 
 route('POST', '/api/auth/verify', 'public', async (req, res, ctx) => {
@@ -492,6 +525,23 @@ function ipReport(u, ip) {
   else if (alerts.length) verdict = `Suspicious: caused ${alerts.length} alert(s) (${types.map(lab).join(', ')}).`;
   return { ip, verdict, allowlisted: !!allow, protected: protectedWhy, blocked: active, first_seen: alerts.length ? alerts[alerts.length - 1].created : null, last_seen: alerts.length ? alerts[0].created : null, alerts, blocks };
 }
+// Where an IP is, who owns it. Looked up on the server (the browser never contacts a lookup service).
+route('GET', '/api/geo/:ip', 'user', async (req, res, ctx) => {
+  if (!auth.rateLimit('geo:' + ctx.user.id, 120, 60000)) throw bad('Too many lookups, slow down', 429);
+  const ip = cleanIp(ctx.params.ip);
+  if (!ip) throw bad('Not a valid IP address');
+  send(res, 200, await geo.lookup(ip));
+});
+// Where the defended network is: the public address one of your online agents connects from.
+route('GET', '/api/geo-site', 'user', async (req, res, ctx) => {
+  const d = db.prepare("SELECT id FROM devices WHERE user_id=? AND virtual=0 AND status='online' ORDER BY last_seen DESC").all(ctx.user.id);
+  for (const x of d) {
+    const st = engine.states.get(x.id);
+    if (st && st.agentIp) { const g = await geo.lookup(st.agentIp); if (g && g.lat != null) return send(res, 200, { lat: g.lat, lon: g.lon, city: g.city, country: g.country, demo: !!g.demo }); }
+  }
+  const sb = ctx.user.read_only ? { lat: 51.5072, lon: -0.1276, city: 'London', country: 'United Kingdom', demo: true } : null; // sandbox sample site
+  send(res, 200, sb || { none: true });
+});
 route('GET', '/api/ip/:ip', 'user', async (req, res, ctx) => send(res, 200, ipReport(ctx.user.id, checkIp(ctx.params.ip))));
 
 route('GET', '/api/hunt', 'user', async (req, res, ctx) => {

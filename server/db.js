@@ -134,4 +134,6 @@ addCol('ALTER TABLE users ADD COLUMN totp_on INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE users ADD COLUMN email_otp INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE users ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0'); // sandbox demo account: can look, cannot change anything
 
+addCol('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1'); // existing accounts stay verified
+
 module.exports = { db, DATA_DIR };

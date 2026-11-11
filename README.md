@@ -113,3 +113,7 @@ Without a key the built-in rule-based assistant is used.
 ## v13 notes
 - Optional Render environment variables: `GEMINI_API_KEY` (real AI Copilot, server-side only), `ADMIN_EMAIL` + `ADMIN_PASSWORD` (+ optional `ADMIN_PIN`) to create your owner account on every start, `SMTP_EMAIL` + `SMTP_PASSWORD` (Gmail app password) to enable e-mail sign-in codes.
 - Sandbox login: demo@netguard.ai / NetGuardDemo2026! (read-only, sample data, or use the "Try the sandbox" button).
+
+## v14 notes
+- Optional environment variables for sign-up e-mail codes (use ONE): `RESEND_API_KEY` or `BREVO_API_KEY` (+ `MAIL_FROM`), or `SMTP_EMAIL` + `SMTP_PASSWORD`. If none is set, sign-ups work without a code.
+- The threat map uses CARTO dark tiles (OpenStreetMap data). Attacker locations come from the free ipwho.is service, called from the server only.

@@ -26,6 +26,21 @@
     for (const p of [].concat(d)) { const path = document.createElementNS(s.namespaceURI, 'path'); path.setAttribute('d', p); s.append(path); }
     return s;
   };
+  const ICON = {
+    eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z',
+    eyeoff: 'M3 3l18 18M10.6 6.1A9.7 9.7 0 0112 5c6 0 10 7 10 7a17 17 0 01-3.2 4.1M6.6 6.6A17 17 0 002 12s4 7 10 7a9.7 9.7 0 004.4-1.1M9.9 9.9a3 3 0 004.2 4.2',
+    wifi: 'M2 8.8a15 15 0 0120 0M5 12.5a10 10 0 0114 0M8.5 16a5 5 0 017 0M12 19.5h.01',
+    lock: 'M5 11h14v10H5zM8 11V7a4 4 0 018 0v4',
+    server: 'M3 4h18v6H3zM3 14h18v6H3zM7 7h.01M7 17h.01',
+    terminal: 'M4 17l6-6-6-6M12 19h8',
+    alert: 'M12 3l9 16H3L12 3zM12 10v4M12 17h.01',
+    menu: 'M4 6h16M4 12h16M4 18h16',
+    arrow: 'M4 12h16M14 6l6 6-6 6',
+    mic: 'M12 3a3 3 0 013 3v6a3 3 0 01-6 0V6a3 3 0 013-3zM5 11a7 7 0 0014 0M12 18v3',
+    stop: 'M6 6h12v12H6z',
+    trash: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6',
+    pin: 'M12 21s7-6 7-12a7 7 0 10-14 0c0 6 7 12 7 12zM12 11a2 2 0 100-4 2 2 0 000 4z',
+  };
   const SHIELD = ['M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z', 'M9 12l2 2 4-4'];
   const WARN = ['M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z', 'M12 9v4M12 17h.01'];
 
@@ -115,6 +130,7 @@
     es.addEventListener('alert', (e) => {
       const a = JSON.parse(e.data);
       (a.demo ? S.demoAlerts : S.alerts).unshift(a);
+      if (S.onAlert) S.onAlert(a);
       refreshStats(); loadInsights();
       if (['critical', 'high'].includes(a.severity)) {
         alarmSound(a);
@@ -194,10 +210,41 @@
   function pwField(label, props) {
     const input = el('input', { type: 'password', required: true, ...props });
     const eye = el('button', { class: 'eye', type: 'button', 'aria-label': 'Show password', title: 'Show / hide password', onclick: () => {
-      const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.textContent = show ? '🙈' : '👁'; eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
-    } }, '👁');
+      const show = input.type === 'password'; input.type = show ? 'text' : 'password'; eye.replaceChildren(svg(show ? ICON.eyeoff : ICON.eye, 18)); eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    } }, svg(ICON.eye, 18));
     const lbl = el('label', {}, el('span', { class: 'lbltxt' }, label), el('span', { class: 'pwbox' }, input, eye));
     return { input, lbl, setLabel: (t) => { lbl.querySelector('.lbltxt').textContent = t; } };
+  }
+
+  // animated logo: shield draws itself, a lock sits inside, a thin scan line passes over it (a constant string, no user data)
+  function logoMark(size = 84) {
+    const doc = new DOMParser().parseFromString(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="${size}" height="${size}" class="logo-svg" role="img" aria-label="NetGuard AI logo">
+        <defs><clipPath id="lgClip"><path d="M32 5l21 8v14c0 14-9 24.500-21 29C20 51.500 11 41 11 27V13z"/></clipPath></defs>
+        <circle class="lg-ring" cx="32" cy="32" r="30" fill="none" stroke-width="1"/>
+        <path class="lg-shield" d="M32 5l21 8v14c0 14-9 24.500-21 29C20 51.500 11 41 11 27V13z" fill="none" stroke-width="2.500" stroke-linejoin="round" pathLength="100"/>
+        <g clip-path="url(#lgClip)"><rect class="lg-scan" x="8" y="5" width="48" height="3" rx="1.500"/></g>
+        <path class="lg-lock" d="M24 31h16v11H24zM27 31v-4a5 5 0 0110 0v4" fill="none" stroke-width="2.200" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle class="lg-dot" cx="32" cy="36.500" r="1.800"/>
+      </svg>`, 'image/svg+xml');
+    return document.importNode(doc.documentElement, true);
+  }
+
+  // big rotating 3D logo for the landing page: stacked shield outlines give depth, a ring orbits it
+  function logoSpin() {
+    const layer = (cls, front) => {
+      const d = new DOMParser().parseFromString(
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" class="sp-layer ${cls}" aria-hidden="true" focusable="false">
+          <path d="M32 5l21 8v14c0 14-9 24.500-21 29C20 51.500 11 41 11 27V13z" fill="${front ? 'rgba(23,23,23,.92)' : 'none'}" stroke-width="${front ? 2.600 : 1.600}" stroke-linejoin="round"/>
+          ${front ? '<path class="sp-lock" d="M24 31h16v11H24zM27 31v-4a5 5 0 0110 0v4" fill="none" stroke-width="2.200" stroke-linejoin="round" stroke-linecap="round"/><circle class="sp-dot" cx="32" cy="36.500" r="1.800"/><path class="sp-trace" d="M17 20h8M39 20h8M32 12v5" fill="none" stroke-width="1.400" stroke-linecap="round"/>' : ''}
+        </svg>`, 'image/svg+xml');
+      return document.importNode(d.documentElement, true);
+    };
+    return el('div', { class: 'spin3d', role: 'img', 'aria-label': 'NetGuard AI rotating shield logo' },
+      el('div', { class: 'sp-stage' },
+        el('div', { class: 'sp-ring r1' }), el('div', { class: 'sp-ring r2' }),
+        ['b3', 'b2', 'b1', 'b0'].map((c) => layer('sp-back ' + c, false)),
+        layer('sp-front', true), layer('sp-front back-face', true)));
   }
 
   function authView() {
@@ -217,7 +264,7 @@
     const sandbox = el('button', { class: 'btn sandbox', type: 'button', onclick: async () => {
       sandbox.disabled = true; err.textContent = '';
       try { await api('POST', '/api/auth/sandbox', {}); await boot(); location.hash = '#/dashboard'; } catch (x) { err.textContent = x.message; } finally { sandbox.disabled = false; }
-    } }, '⚡ Try the sandbox demo (read-only, sample data)');
+    } }, 'Try the sandbox demo (read-only, sample data)');
     const title = el('h2', {}, 'Sign in');
     const code = el('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, required: true });
     const codeLbl = el('label', {}, 'Security PIN (4 digits) or authenticator / e-mail code (6 digits)', code);
@@ -235,9 +282,10 @@
       e.preventDefault(); err.textContent = ''; submit.disabled = true;
       try {
         if (ticket) {
-          await api('POST', '/api/auth/verify', { ticket, code: code.value });
+          await api('POST', ticket.startsWith('mail:') ? '/api/auth/verify-email' : '/api/auth/verify', { ticket: ticket.replace(/^mail:/, ''), code: code.value });
         } else {
           const r = await api('POST', mode === 'login' ? '/api/auth/login' : '/api/auth/signup', { email: email.value.trim().toLowerCase(), password: pw.value, name: name.value, invite: invite.value, pin: pin.value });
+          if (r.verify_email) { ticket = 'mail:' + r.ticket; step1.hidden = true; step2.hidden = false; title.textContent = 'Check your e-mail'; submit.textContent = 'Activate account'; switcher.hidden = true; codeLbl.firstChild.textContent = 'Enter the 6-digit code we sent to ' + r.email; code.focus(); return; }
           if (r.step2) { ticket = r.ticket; step1.hidden = true; step2.hidden = false; title.textContent = 'Second step'; submit.textContent = 'Verify'; switcher.hidden = true; code.focus(); return; }
         }
         await boot(); location.hash = '#/dashboard';
@@ -245,7 +293,7 @@
     } }, title,
       step1, step2, err, el('div', { class: 'inline' }, submit, switcher),
       el('div', { class: 'or' }, 'or'), sandbox,
-      el('p', { class: 'foot', style: 'margin-top:12px' }, el('a', { href: '/privacy.html' }, 'Privacy'), ' · ', el('a', { href: '#support', onclick: (e) => { e.preventDefault(); const t = document.getElementById('pubInfo'); if (t) t.scrollIntoView({ behavior: 'smooth' }); } }, 'Support')));
+      el('p', { class: 'foot', style: 'margin-top:12px' }, el('a', { href: '/privacy.html' }, 'Privacy'), ' · ', el('a', { href: '#pubInfo', onclick: (e) => { e.preventDefault(); const t = document.getElementById('pubInfo'); if (t) t.scrollIntoView({ behavior: 'smooth' }); } }, 'About')));
     step1.append(nameLbl, el('label', {}, 'Email', email), pwf.lbl, pinLbl, inviteLbl);
     step2.append(el('p', { class: 'muted' }, 'Enter the code from your security PIN, authenticator app, or e-mail to finish signing in.'), codeLbl);
     code.required = false; email.required = true;
@@ -254,21 +302,86 @@
     const card = (h, ...kids) => el('div', { class: 'pubcard' }, el('h3', {}, h), ...kids);
     return el('div', { class: 'wrap' },
       el('div', { class: 'auth' },
-        el('div', {},
-          el('div', { class: 'brand' }, el('span', { class: 'mark' }, svg(SHIELD)), el('div', {}, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense'))),
-          el('div', { class: 'scene', 'aria-hidden': 'true' }, el('div', { class: 'shield3d' }, [0, 1, 2, 3, 4, 5].map((i) => el('div', { class: 'layer l' + i })))),
-          el('h2', { class: 'big-h', style: 'margin-top:28px;text-transform:none;letter-spacing:.02em' }, 'Detect attacks on your network and block them automatically.'),
-          el('ul', {},
-            el('li', {}, 'Install the agent on any server, PC or gateway'),
-            el('li', {}, 'It learns normal traffic, then catches floods, port scans and brute-force logins'),
-            el('li', {}, 'Starts in monitor-only mode: you see what it WOULD block before it blocks anything'),
-            el('li', {}, 'Live dashboard, alert history and webhook notifications'))),
+        el('div', { class: 'hero' },
+          logoSpin(),
+          el('div', { class: 'herologo center' }, el('div', {}, el('h1', {}, 'NetGuard ', el('span', {}, 'AI')), el('p', { class: 'tag' }, 'Network & industrial anomaly defense')))),
         form),
       el('div', { class: 'pubinfo', id: 'pubInfo' },
         card('Try it without installing anything', el('p', {}, 'The sandbox is a read-only copy with sample devices and alerts, so you can click around safely. Inside your own account, the Attack Simulator runs a clearly labelled Demo device that never touches a real device or firewall.')),
         card('Supported systems', el('ul', {}, el('li', {}, el('b', {}, 'Linux'), ' (Debian, Ubuntu, Fedora, Raspberry Pi OS): full support, firewall blocking with iptables, optional packet sniffer'), el('li', {}, el('b', {}, 'Windows 10 / 11 / Server'), ': monitoring and blocking with Windows Firewall (run as Administrator)'), el('li', {}, el('b', {}, 'macOS'), ': monitoring only for now'), el('li', {}, 'Needs Python 3.8+ and the psutil package'))),
         card('How installation works', el('ol', {}, el('li', {}, 'Create an account, then open Devices and add a device'), el('li', {}, 'Copy the one-line install command and run it on that machine'), el('li', {}, 'It appears online and learns normal traffic (about a minute)'), el('li', {}, 'Keep it in monitor-only (dry run) until you trust the alerts, then enable live blocking'))),
-        card('Privacy & support', el('p', {}, 'Your devices, alerts and API keys are visible only to your account. API keys and passwords are stored hashed. You can delete your account and all its data at any time. ', el('a', { href: '/privacy.html' }, 'Read the privacy page'), '.'), el('p', {}, 'Support: open an issue at ', el('a', { href: 'https://github.com/stars0027/netguard-ai-repo/issues', target: '_blank', rel: 'noopener' }, 'github.com/stars0027/netguard-ai-repo'), '.'))));
+        card('Privacy & data protection', el('p', {}, 'Your devices, alerts and API keys are visible only to your account. API keys and passwords are stored hashed. You can turn on 2-step verification and delete your account and all its data at any time. ', el('a', { href: '/privacy.html' }, 'Read the privacy page'), '.'))));
+  }
+
+  // ------------------------------------------------------------------ where did it come from? (map + attribution)
+  const geoCache = new Map();
+  function getGeo(ip) {
+    if (!ip) return Promise.resolve(null);
+    if (!geoCache.has(ip)) geoCache.set(ip, api('GET', '/api/geo/' + encodeURIComponent(ip)).catch(() => ({ ip, error: 'Lookup failed' })));
+    return geoCache.get(ip);
+  }
+  const hemi = (v, pos, neg) => Math.abs(v).toFixed(4) + '° ' + (v >= 0 ? pos : neg);
+  const placeText = (g) => [g.city, g.region, g.country].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i).join(', ');
+  const coordText = (g) => (g.lat != null ? `${hemi(g.lat, 'N', 'S')}, ${hemi(g.lon, 'E', 'W')}` : '');
+  function attackFacts(a) {
+    const d = a.detail || {};
+    const ports = d.ports || (d.top_source && d.top_source.ports) || (d.port ? [d.port] : []);
+    return { ports: Array.from(new Set(ports)).slice(0, 12), pps: d.pps || d.pkts_per_s || d.peak_pps || null, blocked: /^(\[Demo\] )?Blocked/.test(a.action || '') };
+  }
+
+  // Map panel with a switch between the real map and the old tactical grid (the radar canvas passed in).
+  function geoPanel(radarCanvas) {
+    let map = null, alive = true, view = 'map';
+    const status = el('p', { class: 'foot geostat', role: 'status' }, 'Loading map…');
+    const wrap = el('div', { class: 'radarbox mapbox' });
+    const mapBtn = el('button', { class: 'btn sm', type: 'button', 'aria-pressed': 'true' }, 'Geographic map');
+    const gridBtn = el('button', { class: 'btn sm', type: 'button', 'aria-pressed': 'false' }, 'Tactical grid');
+    const setView = (v) => { view = v; mapBtn.setAttribute('aria-pressed', String(v === 'map')); gridBtn.setAttribute('aria-pressed', String(v === 'grid')); if (map) map.el.hidden = v !== 'map'; radarCanvas.hidden = v !== 'grid'; };
+    mapBtn.onclick = () => setView('map'); gridBtn.onclick = () => setView('grid');
+    const cardFor = (m, close) => {
+      const g = m.geo || {}, a = m.alert, f = attackFacts(a);
+      const kv = (k, v) => v ? el('div', { class: 'frow' }, el('span', { class: 'k' }, k), el('span', { class: 'v' }, v)) : null;
+      return el('div', { class: 'geocard' },
+        el('div', { class: 'head' }, el('b', {}, 'Geo-forensic card', m.demo ? demoTag('Demo') : null), el('button', { class: 'btn sm', type: 'button', onclick: close, 'aria-label': 'Close card' }, 'Close')),
+        el('p', { class: 'geosec' }, 'Origin'), kv('Country', [g.country_code, g.country].filter(Boolean).join(' · ')), kv('City / region', [g.city, g.region].filter(Boolean).join(', ')), kv('Coordinates', coordText(g)),
+        el('p', { class: 'geosec' }, 'Identity (who)'), kv('Source IP', m.label || m.id), kv('Reverse DNS', g.rdns), kv('ISP / organisation', g.org || g.isp), kv('ASN', g.asn),
+        el('p', { class: 'geosec' }, 'Vector (how / why)'), kv('Attack', typeLabel(a.type) + (m.count > 1 ? ` (${m.count} alerts)` : '')), kv('Targeted ports', f.ports.join(', ')), kv('Packet rate', f.pps != null ? Number(f.pps).toLocaleString() + ' pkt/s' : ''), kv('Firewall', f.blocked ? 'BLOCKED' : 'ACTIVE (not blocked)'),
+        g.note ? el('p', { class: 'muted' }, g.note) : null,
+        el('button', { class: 'btn sm', type: 'button', onclick: () => openForensics(a, async () => { await loadAlerts(); await refreshStats(); build(); }) }, 'Open alert details'));
+    };
+    map = window.NgMap ? window.NgMap.create({ renderCard: cardFor }) : null;
+    if (map) wrap.append(map.el); else wrap.append(el('p', { class: 'muted' }, 'The map could not start in this browser. Use the tactical grid.'));
+    wrap.append(radarCanvas); radarCanvas.hidden = true;
+
+    async function build(focusIp) {
+      if (!map) return;
+      const list = [...S.demoAlerts.map((a) => ({ a, demo: true })), ...S.alerts.map((a) => ({ a, demo: false }))].filter((x) => x.a.src_ip);
+      const by = new Map();
+      for (const { a, demo } of list) {
+        const k = (demo ? 'd:' : 'r:') + a.src_ip; let m = by.get(k);
+        if (!m) { m = { id: a.src_ip, key: k, demo, alert: a, count: 0, severity: a.severity, blocked: false }; by.set(k, m); }
+        m.count += 1; m.blocked = m.blocked || attackFacts(a).blocked; if (a.created > m.alert.created) m.alert = a;
+        if (['critical', 'high'].includes(a.severity)) m.severity = a.severity;
+      }
+      const items = [...by.values()].slice(0, 25);
+      await Promise.all(items.map(async (m) => { m.geo = await getGeo(m.id); m.lat = m.geo && m.geo.lat; m.lon = m.geo && m.geo.lon; }));
+      if (!alive) return;
+      const placed = items.filter((m) => typeof m.lat === 'number');
+      for (const m of placed) m.id = m.key; // keep demo and real sources apart even if the address matched
+      for (const m of placed) m.label = m.key.slice(2);
+      map.setMarkers(placed);
+      status.textContent = placed.length ? `${placed.length} attack origin${placed.length === 1 ? '' : 's'} on the map` + (items.length > placed.length ? `, ${items.length - placed.length} without a public location (internal or lookup unavailable)` : '') + '. Click a marker for details.'
+        : S.alerts.length || S.demoAlerts.length ? 'No attack origins with a public location yet. Internal addresses cannot be placed on a map.' : 'No attacks seen yet. When an alert arrives the map flies to where it came from.';
+      const want = focusIp || (S.mapFocus && ('r:' + S.mapFocus.src_ip)) ;
+      if (want) { const t = placed.find((m) => m.key === want || m.key === 'd:' + want.replace(/^r:/, '')); S.mapFocus = null; if (t) map.select(t.key, true); }
+    }
+    api('GET', '/api/geo-site').then((s) => { if (alive && map && !s.none) map.setSite(s); }).catch(() => {});
+    build(S.mapFocus ? 'r:' + S.mapFocus.src_ip : null);
+    // a new alert (real or demo) arrives: fly to it
+    S.onAlert = async (a) => { if (!alive || !a.src_ip) return; const key = (a.demo ? 'd:' : 'r:') + a.src_ip; await build(); if (map) map.select(key, true); };
+    const prev = current.cleanup; current.cleanup = () => { alive = false; S.onAlert = null; if (map) map.destroy(); if (prev) prev(); };
+    const head = el('span', { class: 'inline' }, mapBtn, gridBtn);
+    return { el: el('div', {}, wrap, status), toggle: head, rebuild: () => build() };
   }
 
   // ------------------------------------------------------------------ shell: collapsible left sidebar + slim header
@@ -314,7 +427,7 @@
     const toggle = () => {
       if (window.innerWidth < 1024) body.classList.toggle('drawer'); else { body.classList.toggle('collapsed'); try { localStorage.setItem('ng_side', body.classList.contains('collapsed') ? '1' : '0'); } catch { /* ignore */ } }
     };
-    const search = el('input', { type: 'search', class: 'navsearch', placeholder: '🔍 Search modules…  (Ctrl+K)', 'aria-label': 'Search modules', oninput: () => {
+    const search = el('input', { type: 'search', class: 'navsearch', placeholder: 'Search modules…  (Ctrl+K)', 'aria-label': 'Search modules', oninput: () => {
       const q = search.value.trim().toLowerCase();
       for (const a of side.querySelectorAll('a.navlink')) a.hidden = !!q && !a.textContent.toLowerCase().includes(q);
       for (const g of side.querySelectorAll('.navgroup')) g.hidden = !g.querySelector('a.navlink:not([hidden])');
@@ -326,12 +439,12 @@
         items.map(([k, label, icon]) => el('a', { class: 'navlink', href: '#/' + k, title: label, 'aria-current': k === active ? 'page' : null, onclick: () => body.classList.remove('drawer') }, svg(icon, 18), el('span', { class: 'navtxt' }, label), k === 'alerts' ? badge : null)))));
     const title = (navItems().find(([k]) => k === active) || ['', 'NetGuard'])[1];
     const header = el('header', { class: 'top2' },
-      el('button', { class: 'btn sm', type: 'button', 'aria-label': 'Toggle menu', onclick: toggle }, '☰'),
+      el('button', { class: 'btn sm', type: 'button', 'aria-label': 'Toggle menu', onclick: toggle }, svg(ICON.menu, 18)),
       el('h2', { class: 'pagetitle' }, title),
       el('div', { class: 'hdr-right' },
-        el('span', { class: 'link' }, el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
+        el('span', { class: 'link' }, svg(ICON.wifi, 16), el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
         el('button', { class: 'btn sm', type: 'button', 'aria-pressed': String(soundOn()), title: 'Alarm sound and notification for serious alerts', onclick: (e) => toggleSound(e.currentTarget) }, soundOn() ? 'Sound on' : 'Sound off'),
-        S.me.sandbox ? null : el('button', { class: 'btn sm', type: 'button', title: 'Hide the screen until you enter your password or PIN', onclick: lockScreen }, '🔒 Lock'),
+        S.me.sandbox ? null : el('button', { class: 'btn sm', type: 'button', title: 'Hide the screen until you enter your password or PIN', onclick: lockScreen }, svg(ICON.lock, 15), ' Lock'),
         el('button', { class: 'btn sm kbd', type: 'button', title: 'Command palette', onclick: openPalette }, 'Ctrl+K'),
         el('span', { class: 'userbadge', title: S.me.email }, (S.me.name || S.me.email).slice(0, 18)),
         el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } }, 'Sign out')));
@@ -345,19 +458,35 @@
     const d = a.detail || {};
     const ports = d.ports || (d.top_source && d.top_source.ports) || (d.port ? [d.port] : []);
     const peak = d.pps || d.pkts_per_s || d.peak_pps || null;
-    const ipKind = !a.src_ip ? '—' : /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|fc|fd|fe80)/i.test(a.src_ip) ? 'Private / internal address' : 'Public internet address (no location database is bundled, so no country is shown)';
+    const ipKind = !a.src_ip ? '—' : /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|fc|fd|fe80)/i.test(a.src_ip) ? 'Private / internal address' : 'Public internet address';
     const ro = !!(S.me && S.me.sandbox);
+    const row = (k, v) => el('div', { class: 'frow' }, el('span', { class: 'k' }, k), el('span', { class: 'v' }, v == null || v === '' ? '—' : v));
+    const whereBox = el('div', {}, el('span', { class: 'muted' }, a.src_ip ? 'Looking up location…' : 'This alert has no source IP.'));
+    const whoBox = el('div', {}, row('Source IP', a.src_ip), row('Address type', ipKind));
+    const fx = attackFacts(a);
+    const whyBox = el('div', {}, row('Attack type', typeLabel(a.type)), row('Evidence', a.title),
+      row('Targeted ports', fx.ports.length ? `${fx.ports.length} port${fx.ports.length === 1 ? '' : 's'}: ${fx.ports.join(', ')}` : null), row('Peak packet rate', peak != null ? Number(peak).toLocaleString() + ' pkt/s' : null),
+      row('Fingerprint', d.fingerprint || 'Not collected (the agent does not identify attack tools)'), row('Action taken', a.action));
+    if (a.src_ip) getGeo(a.src_ip).then((g) => {
+      if (!g) return;
+      if (g.error) { whereBox.replaceChildren(el('span', { class: 'muted' }, g.error)); return; }
+      if (g.private) { whereBox.replaceChildren(el('span', { class: 'muted' }, g.note)); return; }
+      whereBox.replaceChildren(el('div', { class: 'frow' }, el('span', { class: 'k' }, 'Location'), el('span', { class: 'v' }, [placeText(g), coordText(g) ? `(${coordText(g)})` : ''].filter(Boolean).join(' '), g.demo ? demoTag('Demo') : null)),
+        g.lat != null ? el('button', { class: 'btn sm', type: 'button', onclick: () => { S.mapFocus = a; close(); location.hash = '#/dashboard'; if (location.hash === '#/dashboard' && S.onAlert) S.onAlert(a); } }, 'Locate on map') : null,
+        g.note ? el('p', { class: 'muted' }, g.note) : null);
+      whoBox.append(row('Reverse DNS', g.rdns), row('ISP / organisation', g.org || g.isp), row('ASN', g.asn));
+    });
     const close = () => { m.remove(); document.removeEventListener('keydown', esc, true); };
     const esc = (e) => { if (e.key === 'Escape') close(); };
     const act = (fn, okMsg) => async () => { try { await fn(); toast(okMsg); close(); if (after) await after(); } catch (e) { toast(e.message, true); } };
-    const row = (k, v) => el('div', { class: 'frow' }, el('span', { class: 'k' }, k), el('span', { class: 'v' }, v == null || v === '' ? '—' : v));
     const m = el('div', { class: 'palette', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Alert details', onclick: (e) => { if (e.target === m) close(); } },
       el('div', { class: 'palette-box forensic' },
         el('div', { class: 'head' }, el('h2', {}, el('span', { class: 'sev ' + a.severity }, a.severity), ' ' + typeLabel(a.type)), el('button', { class: 'btn sm', onclick: close }, 'Close')),
         el('p', {}, a.title),
-        row('Time', fmtDT(a.created)), row('Attack type', typeLabel(a.type)), row('Source IP', a.src_ip), row('Origin', ipKind),
-        row('Target device', a.device_name), row('Targeted ports', ports.length ? ports.join(', ') : null), row('Peak packet rate', peak != null ? Number(peak).toLocaleString() + ' pkt/s' : null),
-        row('Status', a.status), row('What NetGuard did', a.action),
+        row('Time', fmtDT(a.created)), row('Target device', a.device_name), row('Status', a.status),
+        el('p', { class: 'geosec' }, 'Where (origin)'), whereBox,
+        el('p', { class: 'geosec' }, 'Who (attacker attribution)'), whoBox,
+        el('p', { class: 'geosec' }, 'Why and how (technical evidence and action)'), whyBox,
         el('p', { class: 'k', style: 'margin-top:10px' }, 'Raw telemetry'), el('pre', {}, JSON.stringify(d, null, 2)),
         ro ? el('p', { class: 'muted' }, 'Sandbox is read-only: actions are turned off.') : null,
         el('div', { class: 'inline', style: 'margin-top:12px' },
@@ -557,10 +686,11 @@
     const paintLock = async () => { const on = await getLockdown(); lockBtn.setAttribute('aria-pressed', String(on)); lockBtn.textContent = on ? 'Lockdown: ON' : 'Lockdown: OFF'; };
     lockBtn.onclick = async () => { lockBtn.disabled = true; try { await setLockdown(lockBtn.getAttribute('aria-pressed') !== 'true'); } catch (e) { toast(e.message, true); } lockBtn.disabled = false; paintLock(); };
     paintLock();
+    const gp = geoPanel(radar);
     const radarRow = el('section', { class: 'panel pad radar-panel' },
-      el('div', { class: 'head' }, el('h2', {}, 'Threat radar'), el('span', { class: 'meta' }, lockBtn)),
-      el('div', { class: 'radarbox' }, radar),
-      el('p', { class: 'foot', style: 'margin-top:8px' }, 'Red = active attacker · Lemon X = neutralised · Lockdown = max sensitivity + auto-block · Press Ctrl+K for commands'));
+      el('div', { class: 'head' }, el('h2', {}, 'Threat map'), el('span', { class: 'meta inline' }, gp.toggle, lockBtn)),
+      gp.el,
+      el('p', { class: 'foot', style: 'margin-top:8px' }, 'Red = active attacker · Yellow = blocked · Purple = Demo · Lockdown = max sensitivity + auto-block · Press Ctrl+K for commands'));
     const insightsRow = el('div', { class: 'insights' },
       el('section', { class: 'panel pad score' }, el('div', { class: 'head' }, el('h2', {}, 'Security score')),
         el('div', { class: 'score-wrap' }, el('div', { class: 'ring-box' }, ring, el('div', { class: 'ring-in' }, scoreNum, scoreLbl)), factorsBox)),
@@ -839,7 +969,7 @@
         if (ac.kind === 'block') { await api('POST', '/api/blocks', { ip: ac.ip, reason: 'Blocked from Copilot' }); toast('Blocked ' + ac.ip); }
         else if (ac.kind === 'trust') { await api('POST', '/api/allowlist', { ip: ac.ip, note: 'Added from Copilot' }); toast('Trusted ' + ac.ip); }
         else if (ac.kind === 'lockdown') { await setLockdown(ac.on); }
-        btn.textContent = '✓ ' + btn.textContent; loadInsights();
+        btn.textContent = 'Done: ' + btn.textContent; loadInsights();
       } catch (e) { toast(e.message, true); btn.disabled = false; }
     };
     const add = (who, text, extra = {}) => new Promise((done) => {
@@ -872,7 +1002,7 @@
       if (convo) listen();
     }
     function paintUi(first) {
-      const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label; talkBtn.textContent = convo ? '⏹ ' + u.stop : '🎙 ' + u.talk;
+      const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label; talkBtn.replaceChildren(svg(convo ? ICON.stop : ICON.mic, 16), ' ' + (convo ? u.stop : u.talk));
       chipsBox.replaceChildren(...(getLang() === 'both' ? [...UI.en.chips, ...UI.ta.chips.slice(0, 6)] : u.chips).map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
       if (first) add('bot', getLang() === 'both' ? UI.en.hello + '\n\n' + UI.ta.hello : u.hello, { lang: getLang() });
     }
@@ -1031,11 +1161,12 @@
     }
     const iv = setInterval(paint, 1000); const iv2 = setInterval(loadInsights, 8000);
     current = { tick: paint, logTick: paint, refresh: paint, cleanup: () => { alive = false; clearInterval(iv); clearInterval(iv2); document.getElementById('glow').className = ''; } };
+    const gp = geoPanel(radar);
     (async () => { await Promise.all([loadAlerts(), refreshStats(), loadInsights()]); if (!S.logs.length) S.logs = await api('GET', '/api/logs?limit=30'); paint(); })();
     const fs = el('button', { class: 'btn sm', type: 'button', onclick: () => { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); } }, 'Full screen');
     return el('section', { class: 'view wr' },
       el('div', { class: 'wr-top' }, el('h2', {}, 'NetGuard war room ', el('small', { class: 'muted' }, 'real data only')), el('span', { class: 'meta' }, clock, fs)),
-      el('div', { class: 'wr-main' }, el('div', { class: 'panel wr-radar' }, radar), el('div', { class: 'wr-side' }, big('wScore', 'Security score'), big('wAtk', 'Active attackers'), big('wBlocked', 'Blocked now'), big('wOpen', 'Open alerts'))),
+      el('div', { class: 'wr-main' }, el('div', { class: 'panel wr-radar' }, el('div', { class: 'wr-maphead' }, gp.toggle), gp.el), el('div', { class: 'wr-side' }, big('wScore', 'Security score'), big('wAtk', 'Active attackers'), big('wBlocked', 'Blocked now'), big('wOpen', 'Open alerts'))),
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Live feed'), el('span', { class: 'meta' }, el('i', { class: 'led on' }), 'streaming')), feed));
   }
 

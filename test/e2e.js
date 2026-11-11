@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ng-test-'));
 process.env.ALLOW_PRIVATE_WEBHOOKS = '1';
+process.env.NG_MX_MODE = 'off'; // no real DNS in the test sandbox
 const { server } = require('../server/index.js');
 const http = require('node:http');
 
@@ -214,6 +215,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ok((await call('DELETE', '/api/me', { password: 'nope' })).status === 403, 'deleting own account needs the right password');
   ok((await call('DELETE', '/api/me', { password: 'cee password 1' })).status === 200 && (await call('GET', '/api/me')).status === 401, 'user can delete own account and all data');
   ok((await fetch(base + '/privacy.html')).status === 200, 'privacy page is served');
+
+  console.log('e-mail verification and geo lookup');
+  cookie = '';
+  ok((await call('POST', '/api/auth/signup', { email: 'x@mailinator.com', password: 'long enough pw 1' })).status === 400, 'disposable / fake e-mail domains are refused');
+  ok((await call('POST', '/api/auth/signup', { email: 'x@test.com', password: 'long enough pw 1' })).status === 400, 'test.com is refused');
+  process.env.NG_MAIL_STUB = '1';
+  ok((await call('GET', '/api/public-config')).data.email_verify === true, 'public config says e-mail verification is on');
+  const sg = await call('POST', '/api/auth/signup', { email: 'v@realmail.org', password: 'long enough pw 1' });
+  ok(sg.status === 201 && sg.data.verify_email && !sg.headers.get('set-cookie'), 'signup with mail service: no session until the code is entered');
+  ok((await call('GET', '/api/me')).status === 401, 'unverified account cannot use the app');
+  const outbox = () => JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'mail-outbox.json'), 'utf8'));
+  const code = outbox().pop().text.match(/\b(\d{6})\b/)[1];
+  ok((await call('POST', '/api/auth/verify-email', { ticket: sg.data.ticket, code: code === '000000' ? '111111' : '000000' })).status === 401, 'wrong e-mail code rejected');
+  ok((await call('POST', '/api/auth/verify-email', { ticket: sg.data.ticket, code })).status === 200 && (await call('GET', '/api/me')).data.email === 'v@realmail.org', 'correct e-mail code activates the account and signs in');
+  cookie = '';
+  const lg3 = await call('POST', '/api/auth/login', { email: 'v@realmail.org', password: 'long enough pw 1' });
+  ok(lg3.status === 200 && !lg3.data.verify_email, 'verified account signs in normally');
+  const gs = http.createServer((rq, rs) => { rs.setHeader('Content-Type', 'application/json'); rs.end(JSON.stringify({ success: true, ip: rq.url.slice(1), country: 'Germany', country_code: 'DE', region: 'Hesse', city: 'Frankfurt', latitude: 50.11, longitude: 8.68, connection: { asn: 205100, org: 'Example Org', isp: 'Example ISP' } })); });
+  await new Promise((r) => gs.listen(0, '127.0.0.1', r));
+  process.env.GEO_API_BASE = `http://127.0.0.1:${gs.address().port}`;
+  const g1 = (await call('GET', '/api/geo/8.8.4.4')).data;
+  ok(g1.country_code === 'DE' && g1.city === 'Frankfurt' && g1.asn === 'AS205100' && g1.lat === 50.11, 'geo lookup returns city, coordinates and ASN');
+  ok((await call('GET', '/api/geo/192.168.1.5')).data.private === true, 'private addresses are never sent to the lookup service');
+  const gd = (await call('GET', '/api/geo/198.51.100.23')).data;
+  ok(gd.demo === true && gd.lat != null, 'demo addresses get a labelled, illustrative location');
+  ok((await call('GET', '/api/geo/not-an-ip')).status === 400, 'bad IP rejected by geo route');
+  gs.close(); delete process.env.NG_MAIL_STUB; delete process.env.GEO_API_BASE;
 
   console.log('2-step verification, sandbox, lockout');
   const tw = require('../server/twofa');
