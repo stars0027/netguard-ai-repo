@@ -155,7 +155,7 @@
   async function loadAlerts() { try { S.alerts = await api('GET', '/api/alerts?limit=200'); S.alertsState = 'ok'; } catch { S.alertsState = 'error'; } }
   async function loadDemo() { try { [S.demoAlerts, S.demoLogs] = await Promise.all([api('GET', '/api/alerts?demo=1&limit=30'), api('GET', '/api/logs?demo=1&limit=40')]); } catch { /* demo panel just stays empty */ } }
   async function loadInsights() { try { S.ins = await api('GET', '/api/insights'); if (current.insights) current.insights(); } catch { /* ignore */ } }
-  const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
+  const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', syn_flood: 'SYN flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
   const typeLabel = (t) => TYPE_LABEL[t] || String(t).replace(/_/g, ' ');
   // sound + browser notification when something serious happens (opt-in, remembered per browser)
   const soundOn = () => { try { return localStorage.getItem('ng_sound') === '1'; } catch { return false; } };
@@ -171,7 +171,7 @@
     try { if (document.hidden && 'Notification' in window && Notification.permission === 'granted') new Notification('NetGuard AI: ' + a.title, { body: a.action || a.severity }); } catch { /* ignore */ }
   }
   // spoken alerts in English and Tamil (uses the voices installed on the device; Tamil needs a Tamil voice)
-  const TA_ALERT = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல்', conn_flood: 'இணைப்பு வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', canary: 'கேனரி பொறி திறக்கப்பட்டது' };
+  const TA_ALERT = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல்', conn_flood: 'இணைப்பு வெள்ளம்', syn_flood: 'SYN வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', canary: 'கேனரி பொறி திறக்கப்பட்டது' };
   const voiceMode = () => { try { return localStorage.getItem('ng_voice') || 'both'; } catch { return 'both'; } };
   function sayLine(text, lang) {
     const u = new SpeechSynthesisUtterance(text); u.lang = lang; u.rate = 1; u.volume = 0.9;
@@ -254,7 +254,7 @@
     const email = el('input', { type: 'email', autocomplete: 'email', required: true });
     const pwf = pwField('Password', { autocomplete: 'current-password', minlength: 1 }), pw = pwf.input;
     const pin = el('input', { type: 'password', inputmode: 'numeric', pattern: '\\d{4}', maxlength: 4, autocomplete: 'off', placeholder: 'optional, 4 digits' });
-    const pinLbl = el('label', {}, '4-digit security PIN (extra protection, recommended)', pin);
+    const pinLbl = el('label', {}, '4-digit lock PIN (unlocks the screen when it auto-locks)', pin);
     const invite = el('input', { type: 'text', autocomplete: 'off', maxlength: 40 });
     const inviteLbl = el('label', {}, 'Invite code (ask the owner)', invite); inviteLbl.hidden = true;
     let signupMode = 'open';
@@ -267,8 +267,29 @@
     } }, 'Try the sandbox demo (read-only, sample data)');
     const title = el('h2', {}, 'Sign in');
     const code = el('input', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, required: true });
-    const codeLbl = el('label', {}, 'Security PIN (4 digits) or authenticator / e-mail code (6 digits)', code);
+    const codeLbl = el('label', {}, 'Lock PIN (4 digits) or authenticator / e-mail verification code (6 digits)', code);
     const step1 = el('div', { class: 'form' }), step2 = el('div', { class: 'form' }); step2.hidden = true;
+    // e-mail verification screen (new accounts and unverified accounts): the only way in is the 6-digit code
+    const vcode = el('input', { type: 'text', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', placeholder: '6-DIGIT CODE', 'aria-label': '6-digit verification code' });
+    const vsub = el('p', { class: 'muted' }), vmsg = el('p', { class: 'muted', role: 'status' });
+    let vticket = null, vemail = '';
+    const verifyBtn = el('button', { class: 'btn primary', type: 'button' }, 'Verify code & continue');
+    const resendBtn = el('button', { class: 'btn', type: 'button' }, 'Resend code');
+    const backBtn = el('button', { class: 'btn', type: 'button' }, 'Back to sign in');
+    const step3 = el('div', { class: 'form' }, vsub, vcode, el('div', { class: 'inline' }, verifyBtn, resendBtn, backBtn), vmsg); step3.hidden = true;
+    function showVerify(r) {
+      vticket = r.ticket; vemail = r.email; ticket = null; step1.hidden = true; step2.hidden = true; step3.hidden = false; actions.hidden = true; or.hidden = true; sandbox.hidden = true;
+      title.textContent = 'Enter verification code'; vsub.textContent = `We sent a 6-digit verification code to ${vemail}. Enter the code below to activate your account.`; vcode.value = ''; vmsg.textContent = ''; err.textContent = ''; vcode.focus();
+    }
+    verifyBtn.onclick = async () => {
+      err.textContent = ''; verifyBtn.disabled = true;
+      try { await api('POST', '/api/auth/verify-code', { ticket: vticket, code: vcode.value }); await boot(); location.hash = '#/dashboard'; } catch (x) { err.textContent = x.message; } finally { verifyBtn.disabled = false; }
+    };
+    resendBtn.onclick = async () => {
+      err.textContent = ''; resendBtn.disabled = true;
+      try { const r = await api('POST', '/api/auth/resend-code', { ticket: vticket }); vticket = r.ticket; vmsg.textContent = 'A new code was sent to ' + r.email + '.'; } catch (x) { err.textContent = x.message; } finally { setTimeout(() => { resendBtn.disabled = false; }, 10000); }
+    };
+    backBtn.onclick = () => { vticket = null; step3.hidden = true; step1.hidden = false; actions.hidden = false; or.hidden = false; sandbox.hidden = false; err.textContent = ''; setMode('login'); };
     function setMode(m) {
       mode = m; nameLbl.hidden = m === 'login'; pinLbl.hidden = m === 'login'; inviteLbl.hidden = !(m === 'signup' && signupMode === 'invite');
       title.textContent = m === 'login' ? 'Sign in' : 'Create your account';
@@ -278,21 +299,22 @@
       pw.autocomplete = m === 'login' ? 'current-password' : 'new-password'; err.textContent = '';
     }
     switcher.onclick = () => setMode(mode === 'login' ? 'signup' : 'login');
+    const actions = el('div', { class: 'inline' }, submit, switcher), or = el('div', { class: 'or' }, 'or');
     const form = el('form', { class: 'form panel pad', onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; submit.disabled = true;
       try {
         if (ticket) {
-          await api('POST', ticket.startsWith('mail:') ? '/api/auth/verify-email' : '/api/auth/verify', { ticket: ticket.replace(/^mail:/, ''), code: code.value });
+          await api('POST', '/api/auth/verify', { ticket, code: code.value });
         } else {
           const r = await api('POST', mode === 'login' ? '/api/auth/login' : '/api/auth/signup', { email: email.value.trim().toLowerCase(), password: pw.value, name: name.value, invite: invite.value, pin: pin.value });
-          if (r.verify_email) { ticket = 'mail:' + r.ticket; step1.hidden = true; step2.hidden = false; title.textContent = 'Check your e-mail'; submit.textContent = 'Activate account'; switcher.hidden = true; codeLbl.firstChild.textContent = 'Enter the 6-digit code we sent to ' + r.email; code.focus(); return; }
+          if (r.verify_email) { showVerify(r); return; }
           if (r.step2) { ticket = r.ticket; step1.hidden = true; step2.hidden = false; title.textContent = 'Second step'; submit.textContent = 'Verify'; switcher.hidden = true; code.focus(); return; }
         }
         await boot(); location.hash = '#/dashboard';
       } catch (x) { err.textContent = x.message; } finally { submit.disabled = false; }
     } }, title,
-      step1, step2, err, el('div', { class: 'inline' }, submit, switcher),
-      el('div', { class: 'or' }, 'or'), sandbox,
+      step1, step2, step3, err, actions,
+      or, sandbox,
       el('p', { class: 'foot', style: 'margin-top:12px' }, el('a', { href: '/privacy.html' }, 'Privacy'), ' · ', el('a', { href: '#pubInfo', onclick: (e) => { e.preventDefault(); const t = document.getElementById('pubInfo'); if (t) t.scrollIntoView({ behavior: 'smooth' }); } }, 'About')));
     step1.append(nameLbl, el('label', {}, 'Email', email), pwf.lbl, pinLbl, inviteLbl);
     step2.append(el('p', { class: 'muted' }, 'Enter the code from your security PIN, authenticator app, or e-mail to finish signing in.'), codeLbl);
@@ -315,10 +337,11 @@
 
   // ------------------------------------------------------------------ where did it come from? (map + attribution)
   const geoCache = new Map();
-  function getGeo(ip) {
+  function getGeo(ip, demo) {
     if (!ip) return Promise.resolve(null);
-    if (!geoCache.has(ip)) geoCache.set(ip, api('GET', '/api/geo/' + encodeURIComponent(ip)).catch(() => ({ ip, error: 'Lookup failed' })));
-    return geoCache.get(ip);
+    const key = (demo ? 'd:' : 'r:') + ip;
+    if (!geoCache.has(key)) geoCache.set(key, api('GET', '/api/geo/' + encodeURIComponent(ip) + (demo ? '?demo=1' : '')).catch(() => ({ ip, error: 'Lookup failed' })));
+    return geoCache.get(key);
   }
   const hemi = (v, pos, neg) => Math.abs(v).toFixed(4) + '° ' + (v >= 0 ? pos : neg);
   const placeText = (g) => [g.city, g.region, g.country].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i).join(', ');
@@ -364,7 +387,7 @@
         if (['critical', 'high'].includes(a.severity)) m.severity = a.severity;
       }
       const items = [...by.values()].slice(0, 25);
-      await Promise.all(items.map(async (m) => { m.geo = await getGeo(m.id); m.lat = m.geo && m.geo.lat; m.lon = m.geo && m.geo.lon; }));
+      await Promise.all(items.map(async (m) => { m.geo = await getGeo(m.id, m.demo); m.lat = m.geo && m.geo.lat; m.lon = m.geo && m.geo.lon; }));
       if (!alive) return;
       const placed = items.filter((m) => typeof m.lat === 'number');
       for (const m of placed) m.id = m.key; // keep demo and real sources apart even if the address matched
@@ -466,13 +489,13 @@
     const fx = attackFacts(a);
     const whyBox = el('div', {}, row('Attack type', typeLabel(a.type)), row('Evidence', a.title),
       row('Targeted ports', fx.ports.length ? `${fx.ports.length} port${fx.ports.length === 1 ? '' : 's'}: ${fx.ports.join(', ')}` : null), row('Peak packet rate', peak != null ? Number(peak).toLocaleString() + ' pkt/s' : null),
-      row('Fingerprint', d.fingerprint || 'Not collected (the agent does not identify attack tools)'), row('Action taken', a.action));
-    if (a.src_ip) getGeo(a.src_ip).then((g) => {
+      row('Scanner tool', d.fingerprint || 'Not collected (the agent does not identify attack tools)'), row('Action taken', a.action));
+    if (a.src_ip) getGeo(a.src_ip, !!a.demo || !!(S.me && S.me.sandbox)).then((g) => {
       if (!g) return;
       if (g.error) { whereBox.replaceChildren(el('span', { class: 'muted' }, g.error)); return; }
       if (g.private) { whereBox.replaceChildren(el('span', { class: 'muted' }, g.note)); return; }
       whereBox.replaceChildren(el('div', { class: 'frow' }, el('span', { class: 'k' }, 'Location'), el('span', { class: 'v' }, [placeText(g), coordText(g) ? `(${coordText(g)})` : ''].filter(Boolean).join(' '), g.demo ? demoTag('Demo') : null)),
-        g.lat != null ? el('button', { class: 'btn sm', type: 'button', onclick: () => { S.mapFocus = a; close(); location.hash = '#/dashboard'; if (location.hash === '#/dashboard' && S.onAlert) S.onAlert(a); } }, 'Locate on map') : null,
+        g.lat != null ? el('button', { class: 'btn sm', type: 'button', onclick: () => { S.mapFocus = a; close(); location.hash = '#/dashboard'; if (location.hash === '#/dashboard' && S.onAlert) S.onAlert(a); } }, 'Locate on World Map') : null,
         g.note ? el('p', { class: 'muted' }, g.note) : null);
       whoBox.append(row('Reverse DNS', g.rdns), row('ISP / organisation', g.org || g.isp), row('ASN', g.asn));
     });
@@ -1003,7 +1026,7 @@
     }
     function paintUi(first) {
       const u = ui(); input.placeholder = u.ph; askBtn.textContent = u.ask; labelTxt.textContent = u.label; talkBtn.replaceChildren(svg(convo ? ICON.stop : ICON.mic, 16), ' ' + (convo ? u.stop : u.talk));
-      chipsBox.replaceChildren(...(getLang() === 'both' ? [...UI.en.chips, ...UI.ta.chips.slice(0, 6)] : u.chips).map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
+      chipsBox.replaceChildren(...(getLang() === 'both' ? UI.en.chips : u.chips).map((q) => el('button', { class: 'chip', type: 'button', onclick: () => ask(q) }, q)));
       if (first) add('bot', getLang() === 'both' ? UI.en.hello + '\n\n' + UI.ta.hello : u.hello, { lang: getLang() });
     }
     // hands-free voice conversation: listen -> think -> speak -> listen again
@@ -1285,7 +1308,7 @@
               } catch (x) { msg.textContent = x.message; }
             } }, st.totp ? 'Set up again' : 'Set up'),
             st.totp ? el('button', { class: 'btn sm danger', onclick: run(() => api('DELETE', '/api/security/totp', { password: pw.value }), 'Authenticator removed') }, 'Remove') : null), secretBox),
-        el('div', { class: 'secrow' }, el('b', {}, 'E-mail code: ' + (st.email ? 'ON' : 'off')),
+        el('div', { class: 'secrow' }, el('b', {}, 'E-mail verification code: ' + (st.email ? 'ON' : 'off')),
           st.email_available ? el('button', { class: 'btn sm', onclick: run(() => api('POST', '/api/security/email', { password: pw.value, on: !st.email }), st.email ? 'E-mail code off' : 'E-mail code on') }, st.email ? 'Turn off' : 'Turn on')
             : el('span', { class: 'muted' }, 'Not available: the site owner has not set SMTP_EMAIL and SMTP_PASSWORD on the server.')),
         msg);

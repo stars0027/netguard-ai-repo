@@ -83,9 +83,47 @@ class Counters:
         return rate
 
 
-def sockets(mine):
-    conns, listening = [], []
+TRUSTED_DNS = {"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9"}
+PROBE_STATES = {"SYN_RECV", "TIME_WAIT", "CLOSE_WAIT"}
+SCAN_WINDOW = 30.0
+
+
+def build_trusted(mine, extra=()):
+    """Never treat these as attackers: this host, loopback, gateway, DNS resolvers."""
+    t = set(mine) | set(extra) | TRUSTED_DNS | {"127.0.0.1", "::1"}
+    return {x for x in t if x}
+
+
+class ScanTracker:
+    """Sliding 30 s window of distinct LOCAL ports each remote IP touched in a probing TCP state."""
+
+    def __init__(self):
+        self.seen = collections.defaultdict(dict)  # ip -> {port: last_seen}
+
+    def add(self, ip, port, now):
+        self.seen[ip][port] = now
+
+    def report(self, now, threshold):
+        out = {}
+        for ip in list(self.seen):
+            m = self.seen[ip]
+            for p in [p for p, t in m.items() if now - t > SCAN_WINDOW]:
+                del m[p]
+            if not m:
+                del self.seen[ip]
+            elif len(m) >= threshold:
+                out[ip] = sorted(m)[:300]
+        return out
+
+
+def sockets(trusted, scans=None):
+    """Returns (connections, listening, syn_recv_per_ip). Trusted peers and the user's own
+    outbound web traffic (ESTABLISHED to remote port 80/443) are excluded, so streaming and
+    downloads can never look like a flood or a scan."""
+    conns, listening, syn = [], [], collections.Counter()
+    now = time.time()
     try:
+        listen_ports = {c.laddr.port for c in psutil.net_connections(kind="inet") if c.status == "LISTEN" and c.laddr}
         for c in psutil.net_connections(kind="inet"):
             if c.status == "LISTEN" and c.laddr:
                 proc = ""
@@ -97,11 +135,19 @@ def sockets(mine):
                 listening.append({"port": c.laddr.port, "addr": c.laddr.ip, "proc": proc})
             elif c.raddr and c.laddr:
                 ip = valid_ip(c.raddr.ip)
-                if ip and ip not in mine and not ipaddress.ip_address(ip).is_loopback:
-                    conns.append({"ip": ip, "lport": c.laddr.port, "state": c.status})
+                if not ip or ip in trusted or ipaddress.ip_address(ip).is_loopback:
+                    continue
+                if c.status == "ESTABLISHED" and c.raddr.port in (80, 443) and c.laddr.port not in listen_ports:
+                    continue  # our own browser/app talking to a website or CDN
+                if c.status == "SYN_RECV":
+                    syn[ip] += 1
+                # probing evidence: inbound peer in a half-open/closing state against one of OUR ports
+                if scans is not None and c.status in PROBE_STATES and (c.status == "SYN_RECV" or c.laddr.port in listen_ports):
+                    scans.add(ip, c.laddr.port, now)
+                conns.append({"ip": ip, "lport": c.laddr.port, "state": c.status})
     except (psutil.AccessDenied, PermissionError):
         pass
-    return conns[:3000], listening[:500]
+    return conns[:3000], listening[:500], dict(syn)
 
 
 # ----------------------------------------------------------------------------- packet sniffer
@@ -185,6 +231,68 @@ class AuthTail:
                         break
         except Exception:
             pass
+        return dict(out)
+
+
+class WinAuth:
+    """Windows Security log, Event ID 4625 (failed logon). Needs an elevated (Administrator) prompt."""
+    CMD = ["wevtutil", "qe", "Security", "/q:*[System[(EventID=4625)]]", "/f:text", "/c:20", "/rd:true"]
+    ADDR = re.compile(r"Source Network Address:\s*([0-9a-fA-F:.]+)")
+    DATE = re.compile(r"Date:\s*(\S+)")
+
+    def __init__(self):
+        self.seen = set()
+        self.ok = True
+        self.poll(first=True)
+
+    def poll(self, first=False):
+        out = collections.Counter()
+        try:
+            txt = subprocess.run(self.CMD, capture_output=True, text=True, timeout=8).stdout
+            if not txt and not first:
+                return {}
+            for block in txt.split("Event[")[1:]:
+                key = (self.DATE.search(block) or [None, block[:60]])[1] + block[:40]
+                m = self.ADDR.search(block)
+                if key in self.seen:
+                    continue
+                self.seen.add(key)
+                if first:
+                    continue  # history before the agent started is ignored
+                ip = valid_ip(m.group(1)) if m else None
+                if ip:
+                    out[ip] += 1
+            if len(self.seen) > 2000:
+                self.seen = set(list(self.seen)[-500:])
+        except Exception:
+            self.ok = False
+        return dict(out)
+
+
+class JournalAuth:
+    """Linux without auth.log: follow `journalctl -u ssh`/`sshd` for failed logins."""
+    def __init__(self):
+        self.last = time.time()
+        self.ok = bool(shutil.which("journalctl"))
+
+    def poll(self):
+        out = collections.Counter()
+        if not self.ok:
+            return {}
+        since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.last))
+        self.last = time.time()
+        for unit in ("ssh", "sshd"):
+            try:
+                txt = subprocess.run(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"],
+                                     capture_output=True, text=True, timeout=5).stdout
+            except Exception:
+                continue
+            for line in txt.splitlines():
+                for pat in AuthTail.PATTERNS:
+                    m = pat.search(line)
+                    if m and valid_ip(m.group(1)):
+                        out[valid_ip(m.group(1))] += 1
+                        break
         return dict(out)
 
 
@@ -297,6 +405,7 @@ def main():
     ap.add_argument("--enforce", action="store_true", help="actually block attacker IPs in the OS firewall")
     ap.add_argument("--sniff", action="store_true", help="packet sniffer for per-source stats (Linux, root)")
     ap.add_argument("--include-loopback", action="store_true", help="sniff loopback too (testing only)")
+    ap.add_argument("--scan-ports", type=int, default=15, help="distinct local ports one remote IP must probe within 30 s to be reported as a port scan")
     ap.add_argument("--keep-rules", action="store_true", help="leave firewall rules in place on exit")
     ap.add_argument("--once", action="store_true", help="send one sample, print the reply and exit")
     a = ap.parse_args()
@@ -331,9 +440,22 @@ def main():
             log("packet sniffer ON")
         except Exception as e:
             log(f"sniffer unavailable ({e}); continuing without it (needs Linux + root)")
-    auth_tail = AuthTail() if SYSTEM == "Linux" else None
-    if auth_tail and auth_tail.f:
-        log(f"watching {auth_tail.path} for failed logins")
+    auth_tail = None
+    if SYSTEM == "Linux":
+        auth_tail = AuthTail()
+        if auth_tail.f:
+            log(f"watching {auth_tail.path} for failed logins")
+        else:
+            auth_tail = JournalAuth()
+            if auth_tail.ok:
+                log("watching journalctl (ssh) for failed logins")
+            else:
+                auth_tail = None
+    elif SYSTEM == "Windows":
+        auth_tail = WinAuth()
+        log("watching Windows Security log (Event ID 4625) for failed logons" if auth_tail.ok else "cannot read the Security log: run as Administrator for login monitoring")
+    trusted = build_trusted(protected)
+    scans = ScanTracker()
 
     stop = threading.Event()
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -349,13 +471,14 @@ def main():
         t = time.time()
         dt = max(t - last, 0.001)
         last = t
-        conns, listening = sockets(mine)
+        conns, listening, syn_recv = sockets(trusted, scans)
         payload = {
             "pps": counters.pps(), "hostname": hostname, "os": osname, "agent_version": VERSION,
             "enforce": fw.enabled, "interval": a.interval, "own_ips": sorted(protected),
             "connections": conns, "listening": listening, "enforced": sorted(fw.applied),
             "sources": sniffer.flush(dt) if sniffer else [],
             "auth_failures": auth_tail.poll() if auth_tail else {},
+            "syn_recv": syn_recv, "scans": scans.report(t, a.scan_ports),
         }
         try:
             reply = post(server, a.key, "/api/agent/telemetry", payload)

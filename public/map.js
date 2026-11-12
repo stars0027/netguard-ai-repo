@@ -1,6 +1,6 @@
 'use strict';
-// NetGuard world map: a small self-hosted slippy map (Web Mercator) that draws CARTO "Dark Matter" tiles
-// (OpenStreetMap data), with pan / zoom / flyTo and attack markers. No third-party script is loaded.
+// NetGuard world map: a small self-hosted slippy map (Web Mercator) that draws dark-styled tiles
+// from OpenStreetMap (no API key); if those fail it switches to Esri World Dark Gray. Pan / zoom / flyTo and attack markers. No third-party script is loaded.
 (function () {
   const TILE = 256, MAXZ = 12, MINZ = 1.2;
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -19,12 +19,12 @@
     const svg = sv('svg', { class: 'ngm-svg' });
     const ctl = document.createElement('div'); ctl.className = 'ngm-ctl';
     const card = document.createElement('div'); card.className = 'ngm-card'; card.hidden = true;
-    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = '© OpenStreetMap contributors © CARTO';
+    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = '© OpenStreetMap contributors';
     const note = document.createElement('div'); note.className = 'ngm-note'; note.hidden = true; note.textContent = 'Map tiles could not be loaded (offline or blocked). Markers are still accurate.';
     root.append(tiles, svg, ctl, card, attr, note);
     const mkBtn = (label, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn sm'; b.textContent = label; b.title = title; b.setAttribute('aria-label', title); b.onclick = fn; ctl.append(b); return b; };
 
-    let lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
+    let prov = 'osm', lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
     const pool = new Map();
 
     function size() { w = root.clientWidth || 600; h = root.clientHeight || 340; svg.setAttribute('viewBox', `0 0 ${w} ${h}`); }
@@ -34,15 +34,23 @@
       const Z = clamp(Math.round(z), 1, MAXZ), scale = Math.pow(2, z - Z), ts = TILE * scale, n = Math.pow(2, Z);
       const cx = px(lon, Z) , cy = py(lat, Z);
       const x0 = Math.floor((cx - w / 2 / scale) / TILE), x1 = Math.floor((cx + w / 2 / scale) / TILE), y0 = Math.floor((cy - h / 2 / scale) / TILE), y1 = Math.floor((cy + h / 2 / scale) / TILE);
-      const keep = new Set(), dpr = window.devicePixelRatio > 1 ? '@2x' : '';
+      const keep = new Set();
       for (let ty = Math.max(0, y0); ty <= Math.min(n - 1, y1); ty++) for (let tx = x0; tx <= x1; tx++) {
-        const wx = ((tx % n) + n) % n, key = `${Z}/${tx}/${ty}`; keep.add(key);
+        const wx = ((tx % n) + n) % n, key = `${prov}/${Z}/${tx}/${ty}`; keep.add(key);
         let im = pool.get(key);
         if (!im) {
-          im = new Image(); im.className = 'ngm-tile'; im.alt = ''; im.draggable = false; im.decoding = 'async';
-          im.onerror = () => { im.hidden = true; if (++tileErrors > 3) note.hidden = false; };
+          im = new Image(); im.className = 'ngm-tile' + (prov === 'osm' ? ' osm' : ''); im.alt = ''; im.draggable = false; im.decoding = 'async';
+          const mine = prov;
+          im.onerror = () => {
+            im.hidden = true;
+            if (mine !== prov) return;
+            if (++tileErrors > 3) {
+              if (prov === 'osm') { prov = 'esri'; tileErrors = 0; attr.textContent = 'Tiles © Esri'; for (const [, t] of pool) t.remove(); pool.clear(); render(); } else note.hidden = false; // both providers failed
+            }
+          };
           im.onload = () => { tileErrors = 0; note.hidden = true; };
-          im.src = `https://${'abc'[(wx + ty) % 3]}.basemaps.cartocdn.com/dark_all/${Z}/${wx}/${ty}${dpr}.png`;
+          im.src = prov === 'osm' ? `https://tile.openstreetmap.org/${Z}/${wx}/${ty}.png`
+            : `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${Z}/${ty}/${wx}`;
           tiles.append(im); pool.set(key, im);
         }
         im.style.left = Math.round(w / 2 + (tx * TILE - cx) * scale) + 'px'; im.style.top = Math.round(h / 2 + (ty * TILE - cy) * scale) + 'px'; im.style.width = im.style.height = Math.ceil(ts) + 1 + 'px';

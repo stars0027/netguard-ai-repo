@@ -10,7 +10,7 @@ const scenarios = new Map(); // userId -> { type, ip, until, tick }
 const rand = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
 
 function start(userId, type) {
-  const ip = `10.0.4.${rand(20, 250)}`;
+  const ip = { cyber: '218.92.0.204', scan: '185.220.101.42', brute: '45.155.205.109' }[type] || `10.0.4.${rand(20, 250)}`; // labelled sample attackers (Demo only)
   const dev = db.prepare('SELECT * FROM devices WHERE user_id=? AND virtual=1').get(userId);
   if (!dev) return null;
   if (type === 'spark') {

@@ -355,3 +355,7 @@ code,.code{font-family:var(--mono);font-size:12px;background:#151515;border:1px 
 @media (max-width:900px){.spin3d{height:260px}}
 .sp-front{transform:translateZ(2px);backface-visibility:hidden}
 .sp-front.back-face{transform:rotateY(180deg) translateZ(2px);backface-visibility:hidden}
+
+/* v17: OpenStreetMap tiles are light, so they are inverted into a dark map (Esri dark tiles are left as they are) */
+.ngm-tile.osm{filter:invert(100%) hue-rotate(180deg) brightness(92%) contrast(92%) saturate(80%)}
+.ngmap{background:#0b0e14}

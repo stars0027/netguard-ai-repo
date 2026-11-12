@@ -116,4 +116,11 @@ Without a key the built-in rule-based assistant is used.
 
 ## v14 notes
 - Optional environment variables for sign-up e-mail codes (use ONE): `RESEND_API_KEY` or `BREVO_API_KEY` (+ `MAIL_FROM`), or `SMTP_EMAIL` + `SMTP_PASSWORD`. If none is set, sign-ups work without a code.
-- The threat map uses CARTO dark tiles (OpenStreetMap data). Attacker locations come from the free ipwho.is service, called from the server only.
+- The threat map uses official OpenStreetMap tiles (no API key), darkened with CSS, with an Esri World Dark Gray fallback. Attacker locations come from the free ipwho.is service, called from the server only (cached 24 h).
+
+## v17 notes
+- **Sign-up needs a mail service.** Set ONE of: `BREVO_API_KEY` + `SENDER_EMAIL`, `RESEND_API_KEY` (+ `MAIL_FROM`), `EMAILJS_SERVICE_ID/TEMPLATE_ID/PUBLIC_KEY`, or SMTP. Without one, sign-up says the mail service is not ready (the sandbox button and the `ADMIN_EMAIL`/`ADMIN_PASSWORD` owner login still work). The 6-digit Verification Code is always required; the 4-digit PIN is only the screen lock.
+- Fake/disposable domains are rejected (blocklist + server-side MX lookup).
+- **Agent engine:** trusted addresses (this host, loopback, gateway, DNS 8.8.8.8/1.1.1.1) and your own outbound ESTABLISHED web traffic (ports 80/443) are ignored. SYN flood = `SYN_RECV` per remote IP; port scan = distinct local ports probed in 30 s (`--scan-ports`, default 15) with the exact port list; failed logins from auth.log/secure, `journalctl -u ssh`, or Windows Event 4625 (run as Administrator).
+- Real alerts get country, city, lat/lon, ISP and ASN attached by the server (ipwho.is, cached).
+- Copilot: set `GEMINI_API_KEY` (model `gemini-2.5-flash`) on Render.

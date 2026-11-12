@@ -10,6 +10,7 @@ const DEFAULTS = {
   learn_samples: 30,         // telemetry samples used to learn "normal"
   src_pps_limit: 500,        // packets/s from ONE source that is always a flood
   conn_limit: 100,           // simultaneous connections from ONE source
+  syn_recv_limit: 50,        // half-open (SYN_RECV) connections from ONE source
   port_scan_ports: 15,       // distinct ports touched by ONE source
   brute_force_attempts: 8,   // failed logins from ONE source within 60 s
   webhook_url: '',           // Slack / Discord / generic JSON webhook

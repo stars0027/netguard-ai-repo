@@ -105,8 +105,21 @@ function removeBlock(userId, id) {
   return true;
 }
 
+// Real alerts get Country/City/Lat/Lon/ISP/ASN from the (cached) geo lookup. Runs in the background; failures never block detection.
+function enrichGeo(userId, id, ip) {
+  require('./geo').lookup(ip, false).then((g) => {
+    if (!g || g.error || g.private) return;
+    const row = db.prepare('SELECT detail FROM alerts WHERE id=? AND user_id=?').get(id, userId);
+    if (!row) return;
+    const d = json(row.detail) || {};
+    d.geo = { country: g.country, country_code: g.country_code, city: g.city, region: g.region, lat: g.lat, lon: g.lon, isp: g.isp, asn: g.asn, org: g.org };
+    db.prepare('UPDATE alerts SET detail=? WHERE id=?').run(JSON.stringify(d), id);
+    hub.emit(userId, 'alert_update', { id, updated: now(), detail: d });
+  }).catch(() => {});
+}
 const fresh = (d) => db.prepare('SELECT mode FROM devices WHERE id=?').get(d.id) || d; // mode may change while the agent is running
 function raise(device, a) {
+  if (device.virtual && a.src_ip) { const tool = require('./geo').sampleTool(a.src_ip); a.detail = { ...(a.detail || {}), sample: true, ...(tool ? { fingerprint: tool + ' (sample)' } : {}) }; }
   const userId = device.user_id;
   const st = stateFor(device);
   const t = now();
@@ -148,6 +161,7 @@ function raise(device, a) {
   if (action) db.prepare('UPDATE alerts SET action=? WHERE id=?').run(action, id);
   const row = db.prepare('SELECT * FROM alerts WHERE id=?').get(id);
   hub.emit(userId, 'alert', publicAlert(row));
+  if (a.src_ip && !device.virtual) enrichGeo(userId, id, a.src_ip);
   log(userId, device.id, a.severity === 'critical' || a.severity === 'high' ? 'CRIT' : 'WARN', `${device.virtual ? '[Demo] ' : ''}${a.title}${action ? ' | ' + action : ''}`);
 
   if (cfg.webhook_url && !device.virtual && ['critical', 'high'].includes(a.severity)) {
@@ -169,7 +183,7 @@ function normalize(raw) {
   const t = {
     pps: clamp(r.pps, 0, 1e8, 0), hostname: str(r.hostname, 100), os: str(r.os, 60), agent_version: str(r.agent_version, 20),
     enforce: !!r.enforce, interval: clamp(r.interval, 1, 60, 2), power: str(r.power, 20),
-    sources: [], connections: [], listening: [], auth_failures: {}, own_ips: [], enforced: [],
+    sources: [], connections: [], listening: [], auth_failures: {}, own_ips: [], enforced: [], syn_recv: {}, scans: {},
   };
   for (const s of arr(r.sources, 500)) {
     const ip = cleanIp(s && s.ip); if (!ip) continue;
@@ -187,6 +201,15 @@ function normalize(raw) {
   }
   if (r.auth_failures && typeof r.auth_failures === 'object') {
     for (const [k, v] of Object.entries(r.auth_failures).slice(0, 200)) { const ip = cleanIp(k); if (ip) t.auth_failures[ip] = clamp(v, 0, 1e6, 0); }
+  }
+  if (r.syn_recv && typeof r.syn_recv === 'object') {
+    for (const [k, v] of Object.entries(r.syn_recv).slice(0, 200)) { const ip = cleanIp(k); if (ip) t.syn_recv[ip] = clamp(v, 0, 1e6, 0); }
+  }
+  if (r.scans && typeof r.scans === 'object') {
+    for (const [k, v] of Object.entries(r.scans).slice(0, 100)) {
+      const ip = cleanIp(k); if (!ip) continue;
+      t.scans[ip] = arr(v, 300).map((p) => clamp(p, 0, 65535, 0)).filter(Boolean);
+    }
   }
   for (const k of ['own_ips', 'gateways', 'enforced']) {
     const out = arr(r[k], 200).map(cleanIp).filter(Boolean);
@@ -275,7 +298,8 @@ function ingest(device, raw, remoteAddr) {
   for (const c of t.connections) {
     if (ignorable(c.ip)) continue;
     perIp.set(c.ip, (perIp.get(c.ip) || 0) + 1);
-    if (c.lport) trackScan(st, c.ip, [c.lport], ts);
+    // only probing states count as scan evidence; normal ESTABLISHED traffic (streaming, downloads) never does
+    if (c.lport && (!c.state || ['SYN_RECV', 'TIME_WAIT', 'CLOSE_WAIT', 'NONE'].includes(c.state) || !t.agent_version)) trackScan(st, c.ip, [c.lport], ts);
   }
   for (const [ip, n] of perIp) {
     if (n >= cfg.conn_limit) {
@@ -284,6 +308,14 @@ function ingest(device, raw, remoteAddr) {
         title: `${n} simultaneous connections from ${ip} (limit ${cfg.conn_limit})`, detail: { connections: n, limit: cfg.conn_limit },
       });
     }
+  }
+  for (const [ip, ports] of Object.entries(t.scans)) { if (!ignorable(ip)) trackScan(st, ip, ports, ts); }
+  for (const [ip, n] of Object.entries(t.syn_recv)) {
+    if (ignorable(ip) || n < cfg.syn_recv_limit) continue;
+    raise(device, {
+      type: 'syn_flood', severity: 'critical', src_ip: ip, blockable: true,
+      title: `SYN flood: ${n} half-open (SYN_RECV) connections from ${ip}`, detail: { syn_recv: n, limit: cfg.syn_recv_limit, state: 'SYN_RECV' },
+    });
   }
   for (const [ip, m] of st.scan) {
     for (const [p, at] of m) if (ts - at > 30000) m.delete(p);

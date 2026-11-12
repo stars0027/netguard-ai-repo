@@ -22,7 +22,7 @@ const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP !== '0';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.py': 'text/x-python; charset=utf-8' };
 
 const HEADERS = {
-  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://*.basemaps.cartocdn.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://tile.openstreetmap.org https://server.arcgisonline.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
   'Cross-Origin-Opener-Policy': 'same-origin', 'Permissions-Policy': 'geolocation=(), camera=(), microphone=()',
 };
@@ -92,7 +92,7 @@ function deleteUser(id) {
   db.prepare('DELETE FROM users WHERE id=?').run(id);
 }
 try { db.exec('ALTER TABLE users ADD COLUMN last_login INTEGER'); } catch { /* column already exists */ }
-route('GET', '/api/public-config', 'public', async (req, res) => send(res, 200, { signup: ALLOW_SIGNUP ? signupMode() : 'closed', email_verify: mailer.mailReady() }));
+route('GET', '/api/public-config', 'public', async (req, res) => send(res, 200, { signup: ALLOW_SIGNUP ? signupMode() : 'closed', email_verify: true, mail_ready: mailer.mailReady() }));
 
 // ------------------------------------------------------------------ auth routes
 const twofa = require('./twofa');
@@ -104,8 +104,8 @@ setInterval(() => { for (const [k, t] of vtickets) if (t.exp < now()) vtickets.d
 async function sendVerifyCode(uid, email) {
   if (!auth.rateLimit('vsend:' + uid, 5, 3600000)) throw bad('Too many codes requested. Try again in an hour.', 429);
   const ticket = crypto.randomBytes(24).toString('base64url'), code = String(crypto.randomInt(0, 1e6)).padStart(6, '0');
-  vtickets.set(ticket, { uid, code, exp: now() + 15 * 60000, tries: 0 });
-  try { await mailer.send(email, 'Your NetGuard AI verification code', `Your NetGuard AI verification code is ${code}. It expires in 15 minutes. If you did not create this account, ignore this e-mail.`); }
+  vtickets.set(ticket, { uid, code, exp: now() + 10 * 60000, tries: 0, email });
+  try { await mailer.sendCode(email, code); }
   catch (e) { vtickets.delete(ticket); console.error('mail failed:', e.message); throw bad('We could not send the verification e-mail. Try again in a minute.', 502); }
   return ticket;
 }
@@ -118,7 +118,7 @@ route('POST', '/api/auth/signup', 'public', async (req, res, ctx) => {
     const want = crypto.createHash('sha256').update(String(getMeta('invite_code', '') || '\u0000')).digest(), got = crypto.createHash('sha256').update(String(ctx.body.invite || '')).digest();
     if (!getMeta('invite_code', '') || !crypto.timingSafeEqual(want, got)) throw bad('Wrong or missing invite code', 403);
   }
-  if (!auth.rateLimit('signup:' + ctx.ip, 10, 3600000)) throw bad('Too many sign-ups, try later', 429);
+  if (!auth.rateLimit('signup:' + ctx.ip, Number(process.env.SIGNUP_RATE || 10), 3600000)) throw bad('Too many sign-ups, try later', 429);
   const { email, password, name } = ctx.body;
   if (typeof email !== 'string' || !EMAIL.test(email)) throw bad('Enter a valid email');
   if (typeof password !== 'string' || password.length < 8 || password.length > 200) throw bad('Password must be 8 to 200 characters');
@@ -128,8 +128,10 @@ route('POST', '/api/auth/signup', 'public', async (req, res, ctx) => {
   if (pin !== null && !/^\d{4}$/.test(pin)) throw bad('Security PIN must be exactly 4 digits');
   if (em === DEMO_EMAIL) throw bad('This email is reserved', 409);
   const chk = await emailcheck.check(em);
-  if (!chk.ok) throw bad(chk.reason, 400);
-  const needVerify = mailer.mailReady();
+  if (!chk.ok) throw bad('Please enter a valid, active email address.', 400);
+  // Strict gate: a new account is NEVER activated without the e-mail code. (ALLOW_UNVERIFIED_SIGNUP=1 is for local testing only.)
+  const needVerify = process.env.ALLOW_UNVERIFIED_SIGNUP === '1' ? mailer.mailReady() : true;
+  if (needVerify && !mailer.mailReady()) throw bad('Sign-up is not ready yet: the site owner has not set up the verification e-mail service.', 503);
   const r = db.prepare('INSERT INTO users(email,name,pass_hash,pin_hash,created,email_verified) VALUES(?,?,?,?,?,?)')
     .run(em, String(name || em.split('@')[0]).slice(0, 60), auth.hashPassword(password), pin ? auth.hashPassword(pin) : null, now(), needVerify ? 0 : 1);
   const uid = Number(r.lastInsertRowid);
@@ -174,12 +176,18 @@ route('POST', '/api/auth/login', 'public', async (req, res, ctx) => {
   send(res, 200, { step2: true, ticket, methods });
 });
 
-route('POST', '/api/auth/verify-email', 'public', async (req, res, ctx) => {
+route('POST', '/api/auth/resend-code', 'public', async (req, res, ctx) => {
+  const old = vtickets.get(String(ctx.body.ticket || ''));
+  if (!old) throw bad('That session expired. Sign in again to get a new code.', 401);
+  vtickets.delete(String(ctx.body.ticket));
+  send(res, 200, { ticket: await sendVerifyCode(old.uid, old.email), email: old.email });
+});
+for (const pth of ['/api/auth/verify-code', '/api/auth/verify-email']) route('POST', pth, 'public', async (req, res, ctx) => {
   const key = String(ctx.body.ticket || ''), t = vtickets.get(key);
-  if (!t || t.exp < now()) throw bad('That code expired. Sign in again to get a new one.', 401);
+  if (!t || t.exp < now()) throw bad('That verification code expired. Press Resend code.', 401);
   if (++t.tries > 5) { vtickets.delete(key); throw bad('Too many wrong codes. Sign in again to get a new one.', 429); }
   const code = String(ctx.body.code || '').replace(/\s/g, '');
-  if (!/^\d{6}$/.test(code) || !crypto.timingSafeEqual(Buffer.from(t.code), Buffer.from(code))) throw bad('Wrong code. Check your e-mail and try again.', 401);
+  if (!/^\d{6}$/.test(code) || !crypto.timingSafeEqual(Buffer.from(t.code), Buffer.from(code))) throw bad('Wrong verification code. Check your e-mail and try again.', 401);
   vtickets.delete(key);
   db.prepare('UPDATE users SET email_verified=1 WHERE id=?').run(t.uid);
   engine.log(t.uid, null, 'INFO', 'Welcome to NetGuard AI. Add your first device to start protecting it.');
@@ -530,14 +538,14 @@ route('GET', '/api/geo/:ip', 'user', async (req, res, ctx) => {
   if (!auth.rateLimit('geo:' + ctx.user.id, 120, 60000)) throw bad('Too many lookups, slow down', 429);
   const ip = cleanIp(ctx.params.ip);
   if (!ip) throw bad('Not a valid IP address');
-  send(res, 200, await geo.lookup(ip));
+  send(res, 200, await geo.lookup(ip, ctx.query.get('demo') === '1' || !!ctx.user.read_only));
 });
 // Where the defended network is: the public address one of your online agents connects from.
 route('GET', '/api/geo-site', 'user', async (req, res, ctx) => {
   const d = db.prepare("SELECT id FROM devices WHERE user_id=? AND virtual=0 AND status='online' ORDER BY last_seen DESC").all(ctx.user.id);
   for (const x of d) {
     const st = engine.states.get(x.id);
-    if (st && st.agentIp) { const g = await geo.lookup(st.agentIp); if (g && g.lat != null) return send(res, 200, { lat: g.lat, lon: g.lon, city: g.city, country: g.country, demo: !!g.demo }); }
+    if (st && st.agentIp) { const g = await geo.lookup(st.agentIp, false); if (g && g.lat != null) return send(res, 200, { lat: g.lat, lon: g.lon, city: g.city, country: g.country, demo: !!g.demo }); }
   }
   const sb = ctx.user.read_only ? { lat: 51.5072, lon: -0.1276, city: 'London', country: 'United Kingdom', demo: true } : null; // sandbox sample site
   send(res, 200, sb || { none: true });
@@ -937,17 +945,14 @@ function seedAccounts() {
     db.prepare('INSERT INTO alerts(user_id,device_id,device_name,type,severity,src_ip,title,detail,status,count,created,updated,action,demo) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)')
       .run(uid, dev, name, type, sev, ip, title, '{"sample":true}', status, 1, c, c, action);
   };
-  alert(d1, 'Prod-Edge-Gateway-01', 'flood', 'critical', '198.51.100.23', 'Traffic spike: 4,800 pkt/s from 198.51.100.23', 'Blocked 198.51.100.23 on all your devices', 8);
-  alert(d1, 'Prod-Edge-Gateway-01', 'port_scan', 'high', '203.0.113.77', 'Port scan: 24 ports in 30 s from 203.0.113.77', 'Blocked 203.0.113.77 on all your devices', 35);
-  alert(d2, 'SCADA-PLC-Node-04', 'brute_force', 'high', '192.0.2.88', '9 failed logins in 60 s from 192.0.2.88', 'Blocked 192.0.2.88 on all your devices', 90, 'ack');
-  alert(d2, 'SCADA-PLC-Node-04', 'exposed_port', 'medium', null, 'Modbus port 502 is open to all addresses', 'Restrict port 502 to your plant network.', 200);
-  const setDetail = (type, o) => db.prepare('UPDATE alerts SET detail=? WHERE user_id=? AND type=?').run(JSON.stringify({ ...o, sample: true }), uid, type);
-  setDetail('flood', { pps: 4800, baseline_mean: 120, ports: [80, 443] }); setDetail('port_scan', { pps: 310, ports: [21, 22, 23, 25, 80, 443, 502, 3389] });
-  setDetail('brute_force', { attempts: 9, ports: [22], pps: 40 }); setDetail('exposed_port', { ports: [502] });
-  for (const [ip, why, m] of [['198.51.100.23', 'Traffic spike: 4,800 pkt/s', 8], ['203.0.113.77', 'Port scan', 35], ['192.0.2.88', 'Brute-force login', 90]]) {
-    db.prepare("INSERT INTO blocks(user_id,device_id,ip,reason,source,scope,active,created,expires,demo) VALUES(?,?,?,?,'auto','fleet',1,?,?,0)").run(uid, null, ip, why, t - m * 60000, t + 3600000);
-  }
-  for (const [lvl, msg, m] of [['OK', 'Prod-Edge-Gateway-01 is online (sample data)', 240], ['CRIT', 'Traffic spike: 4,800 pkt/s from 198.51.100.23 | Blocked 198.51.100.23', 8], ['OK', 'Firewall rule created: block 198.51.100.23', 8]]) {
+  alert(d1, 'Prod-Edge-Gateway-01', 'flood', 'critical', '218.92.0.204', 'Traffic spike: 4,800 pkt/s from 218.92.0.204', 'Blocked 218.92.0.204 on all your devices', 8);
+  alert(d1, 'Prod-Edge-Gateway-01', 'port_scan', 'high', '185.220.101.42', 'Port scan: 24 ports in 30 s from 185.220.101.42', 'Blocked 185.220.101.42 on all your devices', 35);
+  alert(d2, 'SCADA-PLC-Node-04', 'brute_force', 'high', '45.155.205.109', '9 failed root logins in 60 s from 45.155.205.109', 'Blocked 45.155.205.109 on all your devices', 90, 'ack');
+  alert(d2, 'SCADA-PLC-Node-04', 'port_scan', 'high', '91.240.118.172', 'Unauthorized Modbus/TCP probe of port 502 from 91.240.118.172', 'Blocked 91.240.118.172 on all your devices', 200);
+  const setDetail = (ip, o) => db.prepare('UPDATE alerts SET detail=? WHERE user_id=? AND src_ip=?').run(JSON.stringify({ ...o, sample: true, fingerprint: geo.sampleTool(ip) + ' (sample)' }), uid, ip);
+  setDetail('218.92.0.204', { pps: 4800, baseline_mean: 120, ports: [80, 443] }); setDetail('185.220.101.42', { pps: 310, ports: [21, 22, 23, 25, 80, 443, 3306, 3389] });
+  setDetail('45.155.205.109', { attempts: 9, ports: [22], pps: 40 }); setDetail('91.240.118.172', { pps: 25, ports: [502] });
+  for (const [lvl, msg, m] of [['OK', 'Prod-Edge-Gateway-01 is online (sample data)', 240], ['CRIT', 'Traffic spike: 4,800 pkt/s from 218.92.0.204 | Blocked 218.92.0.204', 8], ['OK', 'Firewall rule created: block 218.92.0.204', 8]]) {
     db.prepare('INSERT INTO logs(user_id,device_id,ts,level,msg,demo) VALUES(?,?,?,?,?,0)').run(uid, d1, t - m * 60000, lvl, msg);
   }
   for (let i = 0; i < 120; i++) db.prepare('INSERT INTO metrics(device_id,ts,pps) VALUES(?,?,?)').run(d1, t - (120 - i) * 2000, 110 + Math.round(Math.sin(i / 6) * 15) + (i > 100 ? 40 * (i - 100) : 0));
