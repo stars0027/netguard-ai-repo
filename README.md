@@ -116,7 +116,7 @@ Without a key the built-in rule-based assistant is used.
 
 ## v14 notes
 - Optional environment variables for sign-up e-mail codes (use ONE): `RESEND_API_KEY` or `BREVO_API_KEY` (+ `MAIL_FROM`), or `SMTP_EMAIL` + `SMTP_PASSWORD`. If none is set, sign-ups work without a code.
-- The threat map uses official OpenStreetMap tiles (no API key), darkened with CSS, with an Esri World Dark Gray fallback. Attacker locations come from the free ipwho.is service, called from the server only (cached 24 h).
+- The threat map uses Esri World Dark Gray base + reference tiles (no API key; OpenStreetMap tiles are not used because they return 403), darkened to a pitch-black SOC look with CSS, over a built-in continent layer so it is never blank. Attacker locations come from the free ipwho.is service, called from the server only (cached 24 h).
 
 ## v17 notes
 - **Sign-up needs a mail service.** Set ONE of: `BREVO_API_KEY` + `SENDER_EMAIL`, `RESEND_API_KEY` (+ `MAIL_FROM`), `EMAILJS_SERVICE_ID/TEMPLATE_ID/PUBLIC_KEY`, or SMTP. Without one, sign-up says the mail service is not ready (the sandbox button and the `ADMIN_EMAIL`/`ADMIN_PASSWORD` owner login still work). The 6-digit Verification Code is always required; the 4-digit PIN is only the screen lock.

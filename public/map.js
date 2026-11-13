@@ -13,18 +13,31 @@
   const sv = (tag, attrs) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
   const COLORS = { critical: '#ff5557', high: '#ff5557', medium: '#C8792C', low: '#FFF21A', demo: '#A66BFF', site: '#FFF21A', blocked: '#FFF21A' };
 
+  // Coarse built-in continents [lon,lat]. Drawn under the tiles so the map is never blank, even if every tile fails.
+  const LAND = [
+    [[-168,66],[-162,70],[-141,70],[-125,70],[-110,73],[-95,72],[-82,69],[-80,63],[-94,59],[-93,50],[-82,46],[-67,45],[-60,48],[-56,52],[-64,60],[-78,62],[-82,56],[-76,52],[-66,45],[-70,42],[-76,35],[-81,31],[-80,25],[-83,29],[-90,30],[-97,27],[-97,21],[-90,21],[-87,21],[-88,16],[-83,10],[-78,8],[-85,10],[-92,15],[-105,20],[-110,24],[-115,30],[-118,34],[-124,40],[-124,48],[-135,58],[-150,60],[-165,60],[-168,66]],
+    [[-80,8],[-72,12],[-62,10],[-52,5],[-50,0],[-35,-6],[-40,-20],[-48,-27],[-58,-38],[-65,-42],[-68,-52],[-72,-52],[-74,-40],[-71,-20],[-76,-14],[-81,-5],[-78,2],[-80,8]],
+    [[-10,36],[-9,43],[-2,44],[-4,48],[2,51],[8,54],[10,57],[12,56],[20,55],[24,60],[22,66],[28,70],[40,68],[60,69],[70,73],[100,77],[140,72],[170,70],[180,68],[180,65],[160,60],[142,54],[135,44],[128,40],[122,38],[122,30],[120,22],[108,20],[106,10],[100,13],[100,3],[104,1],[98,8],[93,18],[88,22],[80,14],[77,8],[72,20],[67,25],[57,25],[56,27],[50,30],[48,29],[56,18],[44,13],[36,28],[34,31],[28,37],[26,40],[20,40],[16,38],[12,44],[6,43],[-1,38],[-10,36]],
+    [[-17,21],[-10,30],[-5,36],[10,37],[20,33],[32,31],[35,28],[43,12],[51,12],[40,-3],[40,-15],[35,-24],[27,-34],[18,-34],[12,-18],[13,-6],[9,4],[-8,4],[-15,11],[-17,21]],
+    [[113,-22],[122,-18],[130,-12],[137,-12],[142,-11],[146,-19],[153,-26],[150,-37],[141,-38],[130,-32],[115,-34],[113,-22]],
+    [[-55,60],[-45,60],[-20,70],[-20,82],[-60,82],[-72,78],[-55,60]],
+    [[-6,50],[2,52],[-2,58],[-6,56],[-6,50]],
+    [[130,31],[141,41],[145,44],[140,36],[130,31]],
+  ];
+
   function create(opts = {}) {
     const root = document.createElement('div'); root.className = 'ngmap'; root.setAttribute('role', 'application'); root.setAttribute('aria-label', 'World map of attack origins. Drag to pan, scroll or use the buttons to zoom.');
+    const landSvg = sv('svg', { class: 'ngm-land' }); const landPath = sv('path', { class: 'ngm-landp' }); landSvg.append(landPath);
     const tiles = document.createElement('div'); tiles.className = 'ngm-tiles';
     const svg = sv('svg', { class: 'ngm-svg' });
     const ctl = document.createElement('div'); ctl.className = 'ngm-ctl';
     const card = document.createElement('div'); card.className = 'ngm-card'; card.hidden = true;
-    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = '© OpenStreetMap contributors';
-    const note = document.createElement('div'); note.className = 'ngm-note'; note.hidden = true; note.textContent = 'Map tiles could not be loaded (offline or blocked). Markers are still accurate.';
-    root.append(tiles, svg, ctl, card, attr, note);
+    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = 'Tiles © Esri, HERE, Garmin, OpenStreetMap contributors';
+    const note = document.createElement('div'); note.className = 'ngm-note'; note.hidden = true; note.textContent = 'Detailed map tiles could not be loaded. The simplified world outline and markers are still accurate.';
+    root.append(landSvg, tiles, svg, ctl, card, attr, note);
     const mkBtn = (label, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn sm'; b.textContent = label; b.title = title; b.setAttribute('aria-label', title); b.onclick = fn; ctl.append(b); return b; };
 
-    let prov = 'osm', lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
+    let lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
     const pool = new Map();
 
     function size() { w = root.clientWidth || 600; h = root.clientHeight || 340; svg.setAttribute('viewBox', `0 0 ${w} ${h}`); }
@@ -35,22 +48,18 @@
       const cx = px(lon, Z) , cy = py(lat, Z);
       const x0 = Math.floor((cx - w / 2 / scale) / TILE), x1 = Math.floor((cx + w / 2 / scale) / TILE), y0 = Math.floor((cy - h / 2 / scale) / TILE), y1 = Math.floor((cy + h / 2 / scale) / TILE);
       const keep = new Set();
-      for (let ty = Math.max(0, y0); ty <= Math.min(n - 1, y1); ty++) for (let tx = x0; tx <= x1; tx++) {
-        const wx = ((tx % n) + n) % n, key = `${prov}/${Z}/${tx}/${ty}`; keep.add(key);
+      const LAYERS = [
+        { id: 'base', cls: 'base', url: (Z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${Z}/${y}/${x}` },
+        { id: 'ref', cls: 'ref', url: (Z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${Z}/${y}/${x}` },
+      ]; // Esri tile order is {z}/{y}/{x}
+      for (const L of LAYERS) for (let ty = Math.max(0, y0); ty <= Math.min(n - 1, y1); ty++) for (let tx = x0; tx <= x1; tx++) {
+        const wx = ((tx % n) + n) % n, key = `${L.id}/${Z}/${tx}/${ty}`; keep.add(key);
         let im = pool.get(key);
         if (!im) {
-          im = new Image(); im.className = 'ngm-tile' + (prov === 'osm' ? ' osm' : ''); im.alt = ''; im.draggable = false; im.decoding = 'async';
-          const mine = prov;
-          im.onerror = () => {
-            im.hidden = true;
-            if (mine !== prov) return;
-            if (++tileErrors > 3) {
-              if (prov === 'osm') { prov = 'esri'; tileErrors = 0; attr.textContent = 'Tiles © Esri'; for (const [, t] of pool) t.remove(); pool.clear(); render(); } else note.hidden = false; // both providers failed
-            }
-          };
-          im.onload = () => { tileErrors = 0; note.hidden = true; };
-          im.src = prov === 'osm' ? `https://tile.openstreetmap.org/${Z}/${wx}/${ty}.png`
-            : `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${Z}/${ty}/${wx}`;
+          im = new Image(); im.className = 'ngm-tile ' + L.cls; im.alt = ''; im.draggable = false; im.decoding = 'async';
+          im.onerror = () => { im.hidden = true; if (L.id === 'base' && ++tileErrors > 3) note.hidden = false; };
+          im.onload = () => { if (L.id === 'base') { tileErrors = 0; note.hidden = true; } };
+          im.src = L.url(Z, wx, ty);
           tiles.append(im); pool.set(key, im);
         }
         im.style.left = Math.round(w / 2 + (tx * TILE - cx) * scale) + 'px'; im.style.top = Math.round(h / 2 + (ty * TILE - cy) * scale) + 'px'; im.style.width = im.style.height = Math.ceil(ts) + 1 + 'px';
@@ -95,7 +104,15 @@
         svg.append(g);
       }
     }
-    function render() { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { size(); drawTiles(); drawMarkers(); }); }
+    function drawLand() {
+      landSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+      const full = W(z); let d = '';
+      for (const poly of LAND) for (const off of [-full, 0, full]) {
+        d += poly.map(([lo, la], i) => { const x = w / 2 + px(lo, z) - px(lon, z), y = h / 2 + py(la, z) - py(lat, z); return (i ? 'L' : 'M') + (x + off).toFixed(1) + ' ' + y.toFixed(1); }).join('') + 'Z';
+      }
+      landPath.setAttribute('d', d);
+    }
+    function render() { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { size(); drawLand(); drawTiles(); drawMarkers(); }); }
 
     // ---- interaction
     let drag = null;
