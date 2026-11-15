@@ -20,7 +20,7 @@ try:
 except ImportError:
     sys.exit("psutil is required:  pip install psutil")
 
-VERSION = "2.0"
+VERSION = "2.1"
 CHAIN = "NETGUARD"
 RULE_PREFIX = "NetGuard Block "
 SYSTEM = platform.system()
@@ -297,11 +297,52 @@ class JournalAuth:
 
 
 # ----------------------------------------------------------------------------- firewall
+# Industrial / OT protocols: an outside address touching one of these is suspicious on its own.
+OT_PORTS = {502: "Modbus/TCP", 102: "S7comm", 20000: "DNP3", 4840: "OPC-UA"}
+# Private LAN ranges (RFC 1918). Spoofed packets could make us "block" the router or a LAN server, so these are never blocked by default.
+LAN_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
+def is_lan(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.version == 4 and any(a in n for n in LAN_NETS)
+    except ValueError:
+        return False
+
+
+class Anomaly:
+    """Statistical baseline: exponential moving average + rolling variance of a rate.
+    After `learn` samples, a rate is an anomaly only when BOTH z = (rate - mean) / std > z_limit
+    AND the rate is above an absolute floor, so ordinary bursts on a quiet host do not alert."""
+
+    def __init__(self, floor, learn=30, alpha=0.05, z_limit=3.5):
+        self.floor, self.learn, self.alpha, self.z_limit = floor, learn, alpha, z_limit
+        self.n, self.mean, self.var = 0, 0.0, 0.0
+
+    def feed(self, rate):
+        """Returns None, or a dict describing the anomaly."""
+        if self.n < self.learn:
+            self.n += 1
+            d = rate - self.mean
+            self.mean += d / self.n
+            self.var += (d * (rate - self.mean) - self.var) / self.n  # running variance while learning
+            return None
+        std = max(self.var ** 0.5, 0.05 * self.mean, 1.0)
+        z = (rate - self.mean) / std
+        hit = z > self.z_limit and rate > self.floor
+        if not hit:  # an attack must not teach the baseline that attacks are normal
+            d = rate - self.mean
+            self.mean += self.alpha * d
+            self.var = (1 - self.alpha) * (self.var + self.alpha * d * d)
+        return {"rate": round(rate, 1), "mean": round(self.mean, 1), "std": round(std, 1), "z": round(z, 2)} if hit else None
+
+
 class Firewall:
     """Reconciles OS firewall rules to the server's list. Only ever touches rules it created."""
 
-    def __init__(self, enabled, protected):
-        self.enabled, self.protected, self.applied = enabled, set(protected), set()
+    def __init__(self, enabled, protected, allow_lan=False):
+        self.enabled, self.protected, self.applied, self.allow_lan = enabled, set(protected), set(), allow_lan
         self.kind = None
         if not enabled:
             return
@@ -363,6 +404,9 @@ class Firewall:
             if ip in self.protected or a.is_loopback or a.is_unspecified or a.is_multicast:
                 log(f"refusing to block protected address {ip}")
                 continue
+            if is_lan(ip) and not self.allow_lan:
+                log(f"refusing to block private LAN address {ip} (use --allow-lan-block to override)")
+                continue
             want.add(ip)
         for ip in want - self.applied:
             if self._add(ip):
@@ -397,6 +441,60 @@ def post(server, key, path, payload, timeout=6):
         return json.loads(r.read().decode())
 
 
+def service_plan(a, script):
+    """What --install-service will write and run. The API key goes into a private file, never onto a command line."""
+    args = ["--interval", f"{a.interval:g}"]
+    for flag, on in (("--enforce", a.enforce), ("--sniff", a.sniff), ("--allow-lan-block", a.allow_lan_block)):
+        if on:
+            args.append(flag)
+    if SYSTEM == "Linux":
+        env = "/etc/netguard-agent.env"
+        unit = "/etc/systemd/system/netguard-agent.service"
+        text = ("[Unit]\nDescription=NetGuard AI agent\nAfter=network-online.target\nWants=network-online.target\n\n"
+                f"[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={sys.executable} {script} {' '.join(args)}\n"
+                "Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+        return {"os": "Linux", "files": [(env, f"NETGUARD_SERVER={a.server}\nNETGUARD_KEY={a.key}\n", 0o600), (unit, text, 0o644)],
+                "commands": [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "netguard-agent.service"]]}
+    if SYSTEM == "Windows":
+        folder = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "NetGuard")
+        cmd = os.path.join(folder, "agent.cmd")
+        body = (f"@echo off\r\nset NETGUARD_SERVER={a.server}\r\nset NETGUARD_KEY={a.key}\r\n"
+                f'"{sys.executable}" "{script}" {" ".join(args)}\r\n')
+        return {"os": "Windows", "files": [(cmd, body, 0o600)],
+                "commands": [["icacls", folder, "/inheritance:r", "/grant:r", "SYSTEM:(OI)(CI)F", "Administrators:(OI)(CI)F"],
+                             ["schtasks", "/create", "/tn", "NetGuardAgent", "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f", "/tr", f'"{cmd}"'],
+                             ["schtasks", "/run", "/tn", "NetGuardAgent"]]}
+    return None
+
+
+def install_service(a):
+    plan = service_plan(a, os.path.abspath(__file__))
+    if not plan:
+        sys.exit(f"--install-service is not supported on {SYSTEM}")
+    if a.dry_run:
+        print(f"[dry run] would install the NetGuard agent as a {plan['os']} startup service")
+        for path, text, _ in plan["files"]:
+            print("  write", path, "(contains the API key, private)" if "NETGUARD_KEY" in text else "")
+        for c in plan["commands"]:
+            print("  run  ", " ".join(c))
+        return
+    try:
+        for path, text, mode in plan["files"]:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.chmod(path, mode)
+            log(f"wrote {path}")
+        for c in plan["commands"]:
+            r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                sys.exit(f"command failed: {' '.join(c)}\n{r.stderr.strip() or r.stdout.strip()}\nRun as root / Administrator.")
+    except PermissionError:
+        sys.exit("Permission denied. Run with sudo (Linux) or as Administrator (Windows).")
+    log("service installed: the agent now starts at boot and restarts if it stops")
+
+
 def main():
     ap = argparse.ArgumentParser(description="NetGuard AI agent")
     ap.add_argument("--server", default=os.environ.get("NETGUARD_SERVER"), help="e.g. https://netguard.example.com")
@@ -408,10 +506,18 @@ def main():
     ap.add_argument("--scan-ports", type=int, default=15, help="distinct local ports one remote IP must probe within 30 s to be reported as a port scan")
     ap.add_argument("--keep-rules", action="store_true", help="leave firewall rules in place on exit")
     ap.add_argument("--once", action="store_true", help="send one sample, print the reply and exit")
+    ap.add_argument("--allow-lan-block", action="store_true", help="also allow blocking private LAN addresses (10/8, 172.16/12, 192.168/16). Off by default so spoofed packets cannot lock out your router")
+    ap.add_argument("--install-service", action="store_true", help="install as a startup service (systemd on Linux, Scheduled Task on Windows) and exit")
+    ap.add_argument("--dry-run", action="store_true", help="with --install-service: show what would be written and run, change nothing")
+    ap.add_argument("--anomaly-floor", type=float, default=300.0, help="packets/s below which a statistical anomaly is never reported (default 300)")
+    ap.add_argument("--anomaly-floor-conn", type=float, default=150.0, help="connection count below which a statistical anomaly is never reported (default 150)")
     a = ap.parse_args()
     if not a.server or not a.key:
         ap.error("--server and --key are required (or NETGUARD_SERVER / NETGUARD_KEY)")
     server = a.server.rstrip("/")
+    if a.install_service:
+        a.server = server
+        return install_service(a)
     if not server.startswith(("http://", "https://")):
         ap.error("--server must start with http:// or https://")
     if server.startswith("http://") and urlparse(server).hostname not in ("localhost", "127.0.0.1"):
@@ -427,7 +533,7 @@ def main():
     except Exception:
         pass
 
-    fw = Firewall(a.enforce, protected)
+    fw = Firewall(a.enforce, protected, a.allow_lan_block)
     if a.enforce and fw.enabled:
         log(f"enforcement ON ({fw.kind}). Blocks from the server will be applied to this machine.")
     else:
@@ -456,6 +562,7 @@ def main():
         log("watching Windows Security log (Event ID 4625) for failed logons" if auth_tail.ok else "cannot read the Security log: run as Administrator for login monitoring")
     trusted = build_trusted(protected)
     scans = ScanTracker()
+    det_pps, det_conn = Anomaly(a.anomaly_floor), Anomaly(a.anomaly_floor_conn)
 
     stop = threading.Event()
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -472,14 +579,24 @@ def main():
         dt = max(t - last, 0.001)
         last = t
         conns, listening, syn_recv = sockets(trusted, scans)
+        pps_now = counters.pps()
+        ot_hits = collections.defaultdict(set)
+        for c in conns:  # outside addresses touching Modbus / S7 / DNP3 / OPC-UA ports
+            if c["lport"] in OT_PORTS and not is_lan(c["ip"]) and not ipaddress.ip_address(c["ip"]).is_private:
+                ot_hits[c["ip"]].add(c["lport"])
+        hits = [(m, d) for m, d in (("pps", det_pps.feed(pps_now)), ("conn", det_conn.feed(float(len(conns))))) if d]
+        anomaly = max(hits, key=lambda h: h[1]["z"]) if hits else None
         payload = {
-            "pps": counters.pps(), "hostname": hostname, "os": osname, "agent_version": VERSION,
+            "pps": pps_now, "hostname": hostname, "os": osname, "agent_version": VERSION,
             "enforce": fw.enabled, "interval": a.interval, "own_ips": sorted(protected),
             "connections": conns, "listening": listening, "enforced": sorted(fw.applied),
             "sources": sniffer.flush(dt) if sniffer else [],
             "auth_failures": auth_tail.poll() if auth_tail else {},
             "syn_recv": syn_recv, "scans": scans.report(t, a.scan_ports),
+            "ot_hits": {ip: sorted(ps) for ip, ps in ot_hits.items()},
         }
+        if anomaly:
+            payload["anomaly"] = {"metric": anomaly[0], **anomaly[1]}
         try:
             reply = post(server, a.key, "/api/agent/telemetry", payload)
             backoff = 0

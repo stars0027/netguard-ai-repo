@@ -13,6 +13,14 @@
   const sv = (tag, attrs) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
   const COLORS = { critical: '#ff5557', high: '#ff5557', medium: '#C8792C', low: '#FFF21A', demo: '#A66BFF', site: '#FFF21A', blocked: '#FFF21A' };
 
+  const ESRI = (svc) => (Z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/${svc}/MapServer/tile/${Z}/${y}/${x}`;
+  // Tried in order. If one cannot be loaded (blocked, offline, rate-limited) the next is used automatically.
+  const PROVIDERS = [
+    { attr: 'Tiles © Esri, HERE, Garmin, OpenStreetMap contributors', layers: [{ id: 'base', cls: 'base', url: ESRI('Canvas/World_Dark_Gray_Base') }, { id: 'ref', cls: 'ref', url: ESRI('Canvas/World_Dark_Gray_Reference') }] },
+    { attr: '© OpenStreetMap contributors', layers: [{ id: 'base', cls: 'base osm', url: (Z, x, y) => `https://tile.openstreetmap.org/${Z}/${x}/${y}.png` }] },
+    { attr: 'Tiles © Esri, Maxar, Earthstar Geographics', layers: [{ id: 'base', cls: 'base sat', url: ESRI('World_Imagery') }] },
+  ];
+
   // Coarse built-in continents [lon,lat]. Drawn under the tiles so the map is never blank, even if every tile fails.
   const LAND = [
     [[-168,66],[-162,70],[-141,70],[-125,70],[-110,73],[-95,72],[-82,69],[-80,63],[-94,59],[-93,50],[-82,46],[-67,45],[-60,48],[-56,52],[-64,60],[-78,62],[-82,56],[-76,52],[-66,45],[-70,42],[-76,35],[-81,31],[-80,25],[-83,29],[-90,30],[-97,27],[-97,21],[-90,21],[-87,21],[-88,16],[-83,10],[-78,8],[-85,10],[-92,15],[-105,20],[-110,24],[-115,30],[-118,34],[-124,40],[-124,48],[-135,58],[-150,60],[-165,60],[-168,66]],
@@ -32,12 +40,12 @@
     const svg = sv('svg', { class: 'ngm-svg' });
     const ctl = document.createElement('div'); ctl.className = 'ngm-ctl';
     const card = document.createElement('div'); card.className = 'ngm-card'; card.hidden = true;
-    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = 'Tiles © Esri, HERE, Garmin, OpenStreetMap contributors';
+    const attr = document.createElement('div'); attr.className = 'ngm-attr'; attr.textContent = PROVIDERS[0].attr;
     const note = document.createElement('div'); note.className = 'ngm-note'; note.hidden = true; note.textContent = 'Detailed map tiles could not be loaded. The simplified world outline and markers are still accurate.';
     root.append(landSvg, tiles, svg, ctl, card, attr, note);
     const mkBtn = (label, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn sm'; b.textContent = label; b.title = title; b.setAttribute('aria-label', title); b.onclick = fn; ctl.append(b); return b; };
 
-    let lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
+    let prov = 0, lat = 20, lon = 0, z = 2, w = 600, h = 340, markers = [], site = null, selected = null, anim = 0, tileErrors = 0, raf = 0;
     const pool = new Map();
 
     function size() { w = root.clientWidth || 600; h = root.clientHeight || 340; svg.setAttribute('viewBox', `0 0 ${w} ${h}`); }
@@ -48,16 +56,20 @@
       const cx = px(lon, Z) , cy = py(lat, Z);
       const x0 = Math.floor((cx - w / 2 / scale) / TILE), x1 = Math.floor((cx + w / 2 / scale) / TILE), y0 = Math.floor((cy - h / 2 / scale) / TILE), y1 = Math.floor((cy + h / 2 / scale) / TILE);
       const keep = new Set();
-      const LAYERS = [
-        { id: 'base', cls: 'base', url: (Z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/${Z}/${y}/${x}` },
-        { id: 'ref', cls: 'ref', url: (Z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${Z}/${y}/${x}` },
-      ]; // Esri tile order is {z}/{y}/{x}
+      const LAYERS = PROVIDERS[prov].layers; // Esri tile order is {z}/{y}/{x}; OSM is {z}/{x}/{y}
       for (const L of LAYERS) for (let ty = Math.max(0, y0); ty <= Math.min(n - 1, y1); ty++) for (let tx = x0; tx <= x1; tx++) {
         const wx = ((tx % n) + n) % n, key = `${L.id}/${Z}/${tx}/${ty}`; keep.add(key);
         let im = pool.get(key);
         if (!im) {
-          im = new Image(); im.className = 'ngm-tile ' + L.cls; im.alt = ''; im.draggable = false; im.decoding = 'async';
-          im.onerror = () => { im.hidden = true; if (L.id === 'base' && ++tileErrors > 3) note.hidden = false; };
+          im = new Image(); im.className = 'ngm-tile ' + L.cls; const mine = prov; im.alt = ''; im.draggable = false; im.decoding = 'async';
+          im.onerror = () => {
+            im.hidden = true;
+            if (L.id !== 'base' || mine !== prov) return;
+            if (++tileErrors > 3) {
+              tileErrors = 0;
+              if (prov < PROVIDERS.length - 1) { prov++; attr.textContent = PROVIDERS[prov].attr; for (const [, t] of pool) t.remove(); pool.clear(); render(); } else note.hidden = false; // every source failed
+            }
+          };
           im.onload = () => { if (L.id === 'base') { tileErrors = 0; note.hidden = true; } };
           im.src = L.url(Z, wx, ty);
           tiles.append(im); pool.set(key, im);

@@ -17,6 +17,7 @@ const { now, cleanIp, isLoopbackOrSpecial, clamp, json } = require('./util');
 const { getSettings } = require('./settings');
 const { sendWebhook } = require('./notify');
 
+const OT_PORTS = { 502: 'Modbus/TCP (502)', 102: 'S7comm (102)', 20000: 'DNP3 (20000)', 4840: 'OPC-UA (4840)' };
 const states = new Map(); // deviceId -> runtime state (rebuilt after restart; baseline re-learns)
 
 const RISKY_PORTS = {
@@ -162,6 +163,7 @@ function raise(device, a) {
   const row = db.prepare('SELECT * FROM alerts WHERE id=?').get(id);
   hub.emit(userId, 'alert', publicAlert(row));
   if (a.src_ip && !device.virtual) enrichGeo(userId, id, a.src_ip);
+  require('./alertmail').notify(row, device);
   log(userId, device.id, a.severity === 'critical' || a.severity === 'high' ? 'CRIT' : 'WARN', `${device.virtual ? '[Demo] ' : ''}${a.title}${action ? ' | ' + action : ''}`);
 
   if (cfg.webhook_url && !device.virtual && ['critical', 'high'].includes(a.severity)) {
@@ -183,7 +185,7 @@ function normalize(raw) {
   const t = {
     pps: clamp(r.pps, 0, 1e8, 0), hostname: str(r.hostname, 100), os: str(r.os, 60), agent_version: str(r.agent_version, 20),
     enforce: !!r.enforce, interval: clamp(r.interval, 1, 60, 2), power: str(r.power, 20),
-    sources: [], connections: [], listening: [], auth_failures: {}, own_ips: [], enforced: [], syn_recv: {}, scans: {},
+    sources: [], connections: [], listening: [], auth_failures: {}, own_ips: [], enforced: [], syn_recv: {}, scans: {}, ot_hits: {}, anomaly: null,
   };
   for (const s of arr(r.sources, 500)) {
     const ip = cleanIp(s && s.ip); if (!ip) continue;
@@ -210,6 +212,12 @@ function normalize(raw) {
       const ip = cleanIp(k); if (!ip) continue;
       t.scans[ip] = arr(v, 300).map((p) => clamp(p, 0, 65535, 0)).filter(Boolean);
     }
+  }
+  if (r.ot_hits && typeof r.ot_hits === 'object') {
+    for (const [k, v] of Object.entries(r.ot_hits).slice(0, 100)) { const ip = cleanIp(k); if (ip) t.ot_hits[ip] = arr(v, 20).map((p) => clamp(p, 0, 65535, 0)).filter(Boolean); }
+  }
+  if (r.anomaly && typeof r.anomaly === 'object') {
+    t.anomaly = { metric: str(r.anomaly.metric, 20) || 'pps', rate: clamp(r.anomaly.rate, 0, 1e9, 0), mean: clamp(r.anomaly.mean, 0, 1e9, 0), std: clamp(r.anomaly.std, 0, 1e9, 0), z: clamp(r.anomaly.z, 0, 1e6, 0) };
   }
   for (const k of ['own_ips', 'gateways', 'enforced']) {
     const out = arr(r[k], 200).map(cleanIp).filter(Boolean);
@@ -327,6 +335,25 @@ function ingest(device, raw, remoteAddr) {
       });
     }
   }
+  // Industrial / OT protocols: any outside address touching these ports is suspicious by itself.
+  const ot = new Map();
+  for (const c of t.connections) if (OT_PORTS[c.lport] && !ignorable(c.ip)) (ot.get(c.ip) || ot.set(c.ip, new Set()).get(c.ip)).add(c.lport);
+  for (const [ip, ps] of Object.entries(t.ot_hits)) if (!ignorable(ip)) { const m = ot.get(ip) || ot.set(ip, new Set()).get(ip); ps.forEach((p) => OT_PORTS[p] && m.add(p)); }
+  for (const [ip, ps] of ot) {
+    const list = [...ps].sort((a, b) => a - b);
+    raise(device, {
+      type: 'ot_probe', severity: 'high', src_ip: ip, blockable: true,
+      title: `Industrial PLC alert: ${ip} tried ${list.map((p) => OT_PORTS[p]).join(', ')}`, detail: { ports: list, protocols: list.map((p) => OT_PORTS[p]), confidence: 'high' },
+    });
+  }
+  // Statistical anomaly reported by the agent (EMA + Z-score): rate far outside its own learned normal
+  if (t.anomaly && t.anomaly.z > 3.5) {
+    raise(device, {
+      type: 'anomaly', severity: 'high', blockable: false,
+      title: `Statistical anomaly: ${Math.round(t.anomaly.rate)} ${t.anomaly.metric === 'conn' ? 'connections' : 'pkt/s'} vs normal ${Math.round(t.anomaly.mean)} (z=${t.anomaly.z.toFixed(1)})`,
+      detail: { ...t.anomaly, method: 'EMA + Z-score' }, action: 'Check the source of the traffic.',
+    });
+  }
   for (const [ip, n] of Object.entries(t.auth_failures)) {
     if (!n || ignorable(ip)) continue;
     const list = (st.brute.get(ip) || []).filter((e) => ts - e.at < 60000);
@@ -426,6 +453,15 @@ function sweep() {
     }
   }
 }
+// Dead-man switch: an agent that was online and has been silent for more than 3 minutes raises a HIGH alert (once per outage).
+function deadman() {
+  const t = now();
+  for (const d of db.prepare("SELECT d.* FROM devices d JOIN users u ON u.id=d.user_id WHERE d.virtual=0 AND u.read_only=0 AND d.last_seen IS NOT NULL AND d.status IN ('online','offline')").all()) {
+    if (t - d.last_seen <= 180000) continue;
+    if (db.prepare("SELECT 1 FROM alerts WHERE device_id=? AND type='heartbeat_lost' AND created>=?").get(d.id, d.last_seen)) continue;
+    raise({ ...d, status: 'offline' }, { type: 'heartbeat_lost', severity: 'high', title: `Agent heartbeat lost — possible agent termination or host offline (${d.name})`, action: 'Check that the host is on and the NetGuard agent is running. Install it as a service to survive reboots.', detail: { last_seen: d.last_seen, silent_seconds: Math.round((t - d.last_seen) / 1000) } });
+  }
+}
 function prune() {
   const t = now();
   db.prepare('DELETE FROM metrics WHERE ts<?').run(t - 6 * 3600 * 1000);
@@ -436,9 +472,10 @@ function prune() {
   db.prepare('DELETE FROM blocks WHERE active=0 AND created<?').run(t - 30 * 86400 * 1000);
 }
 setInterval(sweep, 10000).unref();
+setInterval(() => { try { deadman(); } catch (e) { console.error('deadman:', e.message); } }, 15000).unref();
 setInterval(prune, 3600000).unref();
 
 module.exports = {
   ingest, ingestEvent, addBlock, removeBlock, protectedReason, desiredBlocks, appliedCount, publicAlert, forgetDevice,
-  log, stateFor, statusOf, states,
+  log, stateFor, statusOf, states, deadman,
 };

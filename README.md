@@ -124,3 +124,16 @@ Without a key the built-in rule-based assistant is used.
 - **Agent engine:** trusted addresses (this host, loopback, gateway, DNS 8.8.8.8/1.1.1.1) and your own outbound ESTABLISHED web traffic (ports 80/443) are ignored. SYN flood = `SYN_RECV` per remote IP; port scan = distinct local ports probed in 30 s (`--scan-ports`, default 15) with the exact port list; failed logins from auth.log/secure, `journalctl -u ssh`, or Windows Event 4625 (run as Administrator).
 - Real alerts get country, city, lat/lon, ISP and ASN attached by the server (ipwho.is, cached).
 - Copilot: set `GEMINI_API_KEY` (model `gemini-2.5-flash`) on Render.
+
+## v20 notes
+- **Screen lock is server-side.** `POST /api/auth/lock` marks the session locked; every other API call returns 423 until `POST /api/auth/unlock` (account password or PIN). F5 or clearing browser storage does not bypass it.
+- **Forgot password:** 6-digit email code (`/api/auth/forgot`, `/api/auth/reset`), 10-minute expiry, 5 tries, resets sign out all sessions. Needs a working mail provider.
+- **Alert emails:** critical/high alerts email the device owner (device, attack type, source IP, country/city/ASN, ports, firewall status), max 1 per source IP per 15 minutes. Toggle: Settings > `email_alerts`. Works with Brevo, Resend or SMTP (not EmailJS, which only carries the code template).
+- **Agent 2.1:** EMA + Z-score anomaly detection, OT ports 502/102/20000/4840, never blocks private (RFC-1918) addresses unless `--allow-lan-block`, `--install-service` (systemd or Windows scheduled task). The server raises a high alert if an agent is silent for more than 3 minutes.
+- **Proxy / limits:** `TRUST_PROXY=1`, `TRUST_PROXY_HOPS` (default 1) and `CLIENT_IP_HEADER` pick the real client IP. Rate limits cover failed agent keys, verification/reset codes and per-email login lockout.
+- **Copilot:** accepts Gemini keys starting `AIza` or `AQ.`, with a smarter local fallback.
+- Tests: `node test/e2e.js` and `python3 test/agent_test.py`.
+
+## v21 notes
+- 2-step sign-in by e-mail code now works through the mail service (Brevo/Resend/EmailJS/SMTP); raw `SMTP_EMAIL` is no longer required.
+- Canary Trap hits are located with the geo lookup (shown on the World Map) and e-mail the owner right away (Brevo/Resend/SMTP).

@@ -13,6 +13,7 @@ const DEFAULTS = {
   syn_recv_limit: 50,        // half-open (SYN_RECV) connections from ONE source
   port_scan_ports: 15,       // distinct ports touched by ONE source
   brute_force_attempts: 8,   // failed logins from ONE source within 60 s
+  email_alerts: true,        // e-mail critical/high alerts for real devices to the account address
   webhook_url: '',           // Slack / Discord / generic JSON webhook
 };
 
@@ -46,6 +47,7 @@ function sanitize(input) {
   if ('conn_limit' in input) s.conn_limit = clamp(input.conn_limit, 5, 1e6, 100);
   if ('port_scan_ports' in input) s.port_scan_ports = clamp(input.port_scan_ports, 3, 65535, 15);
   if ('brute_force_attempts' in input) s.brute_force_attempts = clamp(input.brute_force_attempts, 2, 1000, 8);
+  if ('email_alerts' in input) s.email_alerts = !!input.email_alerts;
   if ('webhook_url' in input) {
     const u = String(input.webhook_url || '').trim().slice(0, 500);
     if (u && !/^https?:\/\/[^\s]+$/i.test(u)) throw new Error('Webhook URL must start with http:// or https://');

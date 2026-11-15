@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS canaries (
 
 // ---- migrations (safe to run on every start) ----
 const addCol = (sql) => { try { db.exec(sql); } catch { /* column already exists */ } };
+addCol('ALTER TABLE sessions ADD COLUMN locked INTEGER NOT NULL DEFAULT 0');
+db.exec(`CREATE TABLE IF NOT EXISTS vtickets (
+  ticket TEXT PRIMARY KEY, uid INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'verify', email TEXT NOT NULL,
+  code_hash TEXT NOT NULL, exp INTEGER NOT NULL, tries INTEGER NOT NULL DEFAULT 0
+)`);
 addCol('ALTER TABLE alerts ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE blocks ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE logs ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');

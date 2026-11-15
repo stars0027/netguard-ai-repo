@@ -22,17 +22,28 @@ const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP !== '0';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.py': 'text/x-python; charset=utf-8' };
 
 const HEADERS = {
-  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://*.arcgisonline.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://*.arcgisonline.com https://tile.openstreetmap.org; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Cross-Origin-Opener-Policy': 'same-origin', 'Permissions-Policy': 'geolocation=(), camera=(), microphone=()',
 };
 if (SECURE) HEADERS['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
 
+const agentFails = new Map();
+setInterval(() => { const t = Date.now(); for (const [k, v] of agentFails) if (v.reset < t) agentFails.delete(k); }, 60000).unref();
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const bad = (msg, status = 400) => new HttpError(status, msg);
 
+// Behind a proxy the LEFT side of X-Forwarded-For is whatever the client typed, so it can be spoofed to dodge rate limits.
+// Only the entries our own proxies appended (from the right) are trusted: TRUST_PROXY_HOPS (default 1) says how many.
+// CLIENT_IP_HEADER (e.g. x-render-client-ip) can name a header that the platform sets itself.
+const PROXY_HOPS = Math.max(1, Number(process.env.TRUST_PROXY_HOPS || 1));
 function clientIp(req) {
-  if (TRUST_PROXY && req.headers['x-forwarded-for']) return cleanIp(String(req.headers['x-forwarded-for']).split(',')[0]) || 'unknown';
+  if (TRUST_PROXY) {
+    const h = String(process.env.CLIENT_IP_HEADER || '').toLowerCase();
+    if (h && req.headers[h]) { const v = cleanIp(String(req.headers[h]).split(',').pop()); if (v) return v; }
+    const parts = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (parts.length) return cleanIp(parts[Math.max(0, parts.length - PROXY_HOPS)]) || 'unknown';
+  }
   return cleanIp(req.socket.remoteAddress || '') || 'unknown';
 }
 
@@ -99,14 +110,21 @@ const twofa = require('./twofa');
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 const mailer = require('./mailer'), emailcheck = require('./emailcheck'), geo = require('./geo');
 // e-mail verification: a 6-digit code must be typed before a new account is activated (only when a mail service is configured)
-const vtickets = new Map(); // ticket -> { uid, code, exp, tries }
-setInterval(() => { for (const [k, t] of vtickets) if (t.exp < now()) vtickets.delete(k); }, 60000).unref();
-async function sendVerifyCode(uid, email) {
+// Codes live in SQLite (table vtickets), so they survive a container restart. Only a hash of the code is stored.
+const vt = {
+  put: (ticket, uid, email, code, kind) => db.prepare('INSERT INTO vtickets(ticket,uid,kind,email,code_hash,exp,tries) VALUES(?,?,?,?,?,?,0)').run(ticket, uid, kind, email, sha256(code), now() + 10 * 60000),
+  get: (ticket) => db.prepare('SELECT * FROM vtickets WHERE ticket=?').get(ticket),
+  del: (ticket) => db.prepare('DELETE FROM vtickets WHERE ticket=?').run(ticket),
+  try: (ticket) => { db.prepare('UPDATE vtickets SET tries=tries+1 WHERE ticket=?').run(ticket); return db.prepare('SELECT tries FROM vtickets WHERE ticket=?').get(ticket); },
+};
+setInterval(() => { try { db.prepare('DELETE FROM vtickets WHERE exp<?').run(now()); } catch { /* ignore */ } }, 60000).unref();
+const codeOk = (t, code) => /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(t.code_hash), Buffer.from(sha256(code)));
+async function sendVerifyCode(uid, email, kind = 'verify') {
   if (!auth.rateLimit('vsend:' + uid, 5, 3600000)) throw bad('Too many codes requested. Try again in an hour.', 429);
   const ticket = crypto.randomBytes(24).toString('base64url'), code = String(crypto.randomInt(0, 1e6)).padStart(6, '0');
-  vtickets.set(ticket, { uid, code, exp: now() + 10 * 60000, tries: 0, email });
-  try { await mailer.sendCode(email, code); }
-  catch (e) { vtickets.delete(ticket); console.error('mail failed:', e.message); throw bad('We could not send the verification e-mail. Try again in a minute.', 502); }
+  vt.put(ticket, uid, email, code, kind);
+  try { await mailer.sendCode(email, code, kind); }
+  catch (e) { vt.del(ticket); console.error('mail failed:', e.message); throw bad(kind === 'reset' ? 'We could not send the reset e-mail. Try again in a minute.' : 'We could not send the verification e-mail. Try again in a minute.', 502); }
   return ticket;
 }
 setInterval(() => { try { db.prepare('DELETE FROM users WHERE email_verified=0 AND created<?').run(now() - 86400000); } catch { /* ignore */ } }, 3600000).unref();
@@ -151,47 +169,87 @@ const noteFail = (ip) => { const f = fails.get(ip) || { n: 0, until: 0 }; if (f.
 setInterval(() => { for (const [k, f] of fails) if (f.until < now() && !f.n) fails.delete(k); }, 600000).unref();
 const tickets = new Map(); // second-step tickets: token -> { uid, exp, tries, otp }
 setInterval(() => { for (const [k, t] of tickets) if (t.exp < now()) tickets.delete(k); }, 60000).unref();
-const methodsOf = (u) => [u.pin_hash ? 'pin' : null, u.totp_on ? 'totp' : null, u.email_otp && twofa.smtpReady() ? 'email' : null].filter(Boolean);
+const methodsOf = (u) => [u.pin_hash ? 'pin' : null, u.totp_on ? 'totp' : null, u.email_otp && (mailer.mailReady() || twofa.smtpReady()) ? 'email' : null].filter(Boolean);
 const startSession = (res, uid, extra = {}) => {
   db.prepare('UPDATE users SET last_login=? WHERE id=?').run(now(), uid);
   send(res, 200, { ok: true, ...extra }, { 'Set-Cookie': auth.cookieHeader(auth.createSession(uid), SECURE) });
 };
 
+// per-account lockout: 10 wrong passwords in 15 minutes lock that account's sign-in for 10 minutes (on top of the per-address lockout)
+const efails = new Map();
+function noteEmailFail(em) {
+  const t = now(), e = efails.get(em);
+  if (!e || e.reset < t) return efails.set(em, { n: 1, reset: t + 15 * 60000, until: 0 });
+  if (++e.n >= 10) { e.until = t + 10 * 60000; e.n = 0; e.reset = t + 15 * 60000; }
+}
+setInterval(() => { const t = now(); for (const [k, e] of efails) if (e.reset < t && e.until < t) efails.delete(k); }, 60000).unref();
 route('POST', '/api/auth/login', 'public', async (req, res, ctx) => {
   const lock = lockLeft(ctx.ip);
   if (lock) throw bad(`Too many wrong passwords. This device is locked out for ${lock} more minute${lock === 1 ? '' : 's'}.`, 429);
   if (!auth.rateLimit('login:' + ctx.ip, 40, 15 * 60000)) throw bad('Too many attempts, wait 15 minutes', 429);
   const em = String(ctx.body.email || '').trim().toLowerCase();
+  const ef = efails.get(em);
+  if (ef && ef.until > now()) throw bad(`Too many wrong passwords for this account. Try again in ${Math.ceil((ef.until - now()) / 60000)} minute(s), or use Forgot password.`, 429);
   const u = db.prepare('SELECT * FROM users WHERE email=?').get(em);
   if (!u) { auth.verifyPassword('x', 's1$AAAAAAAAAAAAAAAAAAAAAA==$' + 'A'.repeat(86)); noteFail(ctx.ip); throw bad("Account not found for this email. Click 'CREATE AN ACCOUNT' below.", 401); }
-  if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) { noteFail(ctx.ip); throw bad('Incorrect password. Click the eye icon to verify your typing.', 401); }
-  fails.delete(ctx.ip);
+  if (!auth.verifyPassword(String(ctx.body.password || ''), u.pass_hash)) { noteFail(ctx.ip); noteEmailFail(em); throw bad('Incorrect password. Click the eye icon to verify your typing.', 401); }
+  fails.delete(ctx.ip); efails.delete(em);
   if (!u.email_verified) return send(res, 200, { verify_email: true, ticket: await sendVerifyCode(u.id, u.email), email: u.email });
   const methods = methodsOf(u);
   if (!methods.length || u.read_only) return startSession(res, u.id);
   const ticket = crypto.randomBytes(24).toString('base64url');
   const t = { uid: u.id, exp: now() + 5 * 60000, tries: 0, otp: null };
   tickets.set(ticket, t);
-  if (methods.includes('email')) { t.otp = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); twofa.sendMail(u.email, 'Your NetGuard AI sign-in code', `Your NetGuard AI code is ${t.otp}. It expires in 5 minutes. If this was not you, change your password.`).catch(() => { t.otp = null; }); }
+  if (methods.includes('email')) { t.otp = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); (mailer.mailReady() ? mailer.sendCode(u.email, t.otp, 'verify') : twofa.sendMail(u.email, 'Your NetGuard AI sign-in code', `Your NetGuard AI code is ${t.otp}. It expires in 5 minutes. If this was not you, change your password.`)).catch(() => { t.otp = null; }); }
   send(res, 200, { step2: true, ticket, methods });
 });
 
 route('POST', '/api/auth/resend-code', 'public', async (req, res, ctx) => {
-  const old = vtickets.get(String(ctx.body.ticket || ''));
-  if (!old) throw bad('That session expired. Sign in again to get a new code.', 401);
-  vtickets.delete(String(ctx.body.ticket));
+  const old = vt.get(String(ctx.body.ticket || ''));
+  if (!old || old.kind !== 'verify') throw bad('That session expired. Sign in again to get a new code.', 401);
+  vt.del(old.ticket);
   send(res, 200, { ticket: await sendVerifyCode(old.uid, old.email), email: old.email });
 });
 for (const pth of ['/api/auth/verify-code', '/api/auth/verify-email']) route('POST', pth, 'public', async (req, res, ctx) => {
-  const key = String(ctx.body.ticket || ''), t = vtickets.get(key);
-  if (!t || t.exp < now()) throw bad('That verification code expired. Press Resend code.', 401);
-  if (++t.tries > 5) { vtickets.delete(key); throw bad('Too many wrong codes. Sign in again to get a new one.', 429); }
+  if (!auth.rateLimit('vcode-ip:' + ctx.ip, 10, 300000)) throw bad('Too many code attempts from this network. Wait 5 minutes.', 429);
+  const key = String(ctx.body.ticket || ''), t = vt.get(key);
+  if (!t || t.kind !== 'verify' || t.exp < now()) throw bad('That verification code expired. Press Resend code.', 401);
+  if (vt.try(key).tries > 5) { vt.del(key); throw bad('Too many wrong codes. Sign in again to get a new one.', 429); }
   const code = String(ctx.body.code || '').replace(/\s/g, '');
-  if (!/^\d{6}$/.test(code) || !crypto.timingSafeEqual(Buffer.from(t.code), Buffer.from(code))) throw bad('Wrong verification code. Check your e-mail and try again.', 401);
-  vtickets.delete(key);
+  if (!codeOk(t, code)) throw bad('Wrong verification code. Check your e-mail and try again.', 401);
+  vt.del(key);
   db.prepare('UPDATE users SET email_verified=1 WHERE id=?').run(t.uid);
   engine.log(t.uid, null, 'INFO', 'Welcome to NetGuard AI. Add your first device to start protecting it.');
   startSession(res, t.uid);
+});
+
+// ---- forgot password: 6-digit code by e-mail, then a new password ----
+// The answer never reveals whether an account exists. Accounts that cannot use it (sandbox, unverified) simply get no mail.
+route('POST', '/api/auth/forgot', 'public', async (req, res, ctx) => {
+  if (!auth.rateLimit('forgot-ip:' + ctx.ip, 8, 3600000)) throw bad('Too many reset requests. Try again in an hour.', 429);
+  const em = String(ctx.body.email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em) || em.length > 200) throw bad('Enter the e-mail address of your account.');
+  if (!mailer.mailReady()) throw bad('E-mail is not set up on this server yet, so a reset code cannot be sent. Ask the site owner.', 503);
+  const u = db.prepare('SELECT id,email,read_only FROM users WHERE email=?').get(em);
+  let ticket = crypto.randomBytes(24).toString('base64url'); // a believable ticket even when nothing was sent
+  if (u && !u.read_only && u.email !== DEMO_EMAIL) ticket = await sendVerifyCode(u.id, u.email, 'reset');
+  send(res, 200, { ok: true, ticket, message: 'If that e-mail has an account, a 6-digit reset code is on its way.' });
+});
+route('POST', '/api/auth/reset', 'public', async (req, res, ctx) => {
+  if (!auth.rateLimit('reset-ip:' + ctx.ip, 15, 300000)) throw bad('Too many code attempts from this network. Wait 5 minutes.', 429);
+  const key = String(ctx.body.ticket || ''), t = vt.get(key);
+  if (!t || t.kind !== 'reset' || t.exp < now()) throw bad('That reset code expired or is not valid. Ask for a new one.', 401);
+  const password = ctx.body.password;
+  if (typeof password !== 'string' || password.length < 8 || password.length > 200) throw bad('Password must be 8 to 200 characters');
+  if (vt.try(key).tries > 5) { vt.del(key); throw bad('Too many wrong codes. Ask for a new reset code.', 429); }
+  const code = String(ctx.body.code || '').replace(/\s/g, '');
+  if (!codeOk(t, code)) throw bad('Wrong reset code. Check your e-mail and try again.', 401);
+  vt.del(key);
+  db.prepare('UPDATE users SET pass_hash=?, email_verified=1 WHERE id=?').run(auth.hashPassword(password), t.uid);
+  auth.destroyUserSessions(t.uid);
+  fails.delete(ctx.ip);
+  engine.log(t.uid, null, 'INFO', 'Password was reset with an e-mail code. All other sessions were signed out.');
+  send(res, 200, { ok: true, message: 'Password updated. Sign in with the new password.' });
 });
 
 route('POST', '/api/auth/verify', 'public', async (req, res, ctx) => {
@@ -213,10 +271,14 @@ route('POST', '/api/auth/unlock', 'user', async (req, res, ctx) => {
   if (!auth.rateLimit('unlock:' + ctx.user.id, 10, 5 * 60000)) throw bad('Too many tries. Wait 5 minutes.', 429);
   const u = db.prepare('SELECT pass_hash, pin_hash, read_only FROM users WHERE id=?').get(ctx.user.id);
   const secret = String(ctx.body.secret || '');
-  if (u.read_only) return send(res, 200, { ok: true });
+  if (u.read_only) { auth.setLocked(ctx.user.token, false); return send(res, 200, { ok: true, locked: false }); }
   if (!((u.pin_hash && /^\d{4}$/.test(secret) && auth.verifyPassword(secret, u.pin_hash)) || auth.verifyPassword(secret, u.pass_hash))) throw bad('Wrong password or PIN', 401);
-  send(res, 200, { ok: true });
+  auth.setLocked(ctx.user.token, false); // the lock is kept in the database, so it is only released here
+  send(res, 200, { ok: true, locked: false });
 });
+// Lock the screen ON THE SERVER: refreshing the page (F5) or calling the API directly stays blocked until the PIN/password is entered.
+route('POST', '/api/auth/lock', 'user', async (req, res, ctx) => { auth.setLocked(ctx.user.token, true); send(res, 200, { ok: true, locked: true }); });
+route('GET', '/api/auth/me', 'user', async (req, res, ctx) => send(res, 200, { id: ctx.user.id, email: ctx.user.email, name: ctx.user.name, sandbox: ctx.user.read_only, locked: !!ctx.user.locked }));
 
 // Sandbox: signs in to the shared read-only demo account (sample data only, nothing real).
 route('POST', '/api/auth/sandbox', 'public', async (req, res, ctx) => {
@@ -235,7 +297,7 @@ const needPassword = (ctx) => {
 };
 route('GET', '/api/security', 'user', async (req, res, ctx) => {
   const u = db.prepare('SELECT pin_hash,totp_on,email_otp,read_only FROM users WHERE id=?').get(ctx.user.id);
-  send(res, 200, { pin: !!u.pin_hash, totp: !!u.totp_on, email: !!u.email_otp, email_available: twofa.smtpReady(), sandbox: !!u.read_only });
+  send(res, 200, { pin: !!u.pin_hash, totp: !!u.totp_on, email: !!u.email_otp, email_available: mailer.mailReady() || twofa.smtpReady(), sandbox: !!u.read_only });
 });
 route('POST', '/api/security/pin', 'user', async (req, res, ctx) => {
   needPassword(ctx);
@@ -259,7 +321,7 @@ route('POST', '/api/security/totp/enable', 'user', async (req, res, ctx) => {
 route('DELETE', '/api/security/totp', 'user', async (req, res, ctx) => { needPassword(ctx); db.prepare('UPDATE users SET totp_on=0, totp_secret=NULL WHERE id=?').run(ctx.user.id); send(res, 200, { ok: true }); });
 route('POST', '/api/security/email', 'user', async (req, res, ctx) => {
   needPassword(ctx);
-  if (!twofa.smtpReady()) throw bad('E-mail codes are not set up on this server (SMTP_EMAIL / SMTP_PASSWORD missing).');
+  if (!mailer.mailReady() && !twofa.smtpReady()) throw bad('E-mail codes are not set up on this server (set BREVO_API_KEY + SENDER_EMAIL, or SMTP_EMAIL / SMTP_PASSWORD).');
   db.prepare('UPDATE users SET email_otp=? WHERE id=?').run(ctx.body.on ? 1 : 0, ctx.user.id);
   send(res, 200, { ok: true });
 });
@@ -279,7 +341,7 @@ route('POST', '/api/auth/password', 'user', async (req, res, ctx) => {
   send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookieHeader(auth.createSession(ctx.user.id), SECURE) });
 });
 
-route('GET', '/api/me', 'user', async (req, res, ctx) => send(res, 200, { id: ctx.user.id, email: ctx.user.email, name: ctx.user.name, sandbox: ctx.user.read_only }));
+route('GET', '/api/me', 'user', async (req, res, ctx) => send(res, 200, { id: ctx.user.id, email: ctx.user.email, name: ctx.user.name, sandbox: ctx.user.read_only, locked: !!ctx.user.locked }));
 
 // delete my own account and all my data
 route('DELETE', '/api/me', 'user', async (req, res, ctx) => {
@@ -516,7 +578,7 @@ route('GET', '/api/alerts.csv', 'user', async (req, res, ctx) => {
 });
 
 // ------------------------------------------------------------------ IP inspector, threat hunt, copilot
-const LABEL = { flood: 'traffic flood', port_scan: 'port scan', brute_force: 'brute-force login', conn_flood: 'connection flood', exposed_port: 'exposed service', physical_anomaly: 'physical event', traffic_drop: 'traffic drop', device_offline: 'device offline', canary: 'canary trap' };
+const LABEL = { flood: 'traffic flood', port_scan: 'port scan', brute_force: 'brute-force login', conn_flood: 'connection flood', exposed_port: 'exposed service', physical_anomaly: 'physical event', traffic_drop: 'traffic drop', device_offline: 'device offline', canary: 'canary trap', ot_probe: 'industrial PLC probe', anomaly: 'statistical anomaly', heartbeat_lost: 'agent heartbeat lost', syn_flood: 'SYN flood' };
 const lab = (t) => LABEL[t] || String(t).replace(/_/g, ' ');
 const ago = (ts) => { const m = Math.round((now() - ts) / 60000); return m < 1 ? 'just now' : m < 90 ? m + ' min ago' : m < 2880 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' days ago'; };
 function ipReport(u, ip) {
@@ -597,7 +659,19 @@ function copilotAnswer(u, rawQ, lang) {
   const ipm = q.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/), ip = ipm && cleanIp(ipm[0]);
   let ans, kind = 'help';
 
-  if (has(/^(hi|hello|hey|vanakkam)\b|வணக்கம்|ஹாய்/)) { kind = 'greet'; ans = L('Hello! I am NetGuard Copilot. Ask me about your security in plain words, in English or Tamil.', 'வணக்கம்! நான் NetGuard Copilot. உங்கள் பாதுகாப்பைப் பற்றி எளிய தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.'); }
+  const openAlerts = db.prepare("SELECT COUNT(*) c FROM alerts WHERE user_id=? AND demo=0 AND status='open'").get(u).c;
+  const online = devs.filter((d) => d.status === 'online').length;
+  const live = L(`Right now: ${openAlerts} open alert(s), ${online} of ${devs.length} device(s) online, security score ${I.score == null ? 'n/a' : I.score + '/100'}.`, `இப்போது: ${openAlerts} திறந்த அலெர்ட்கள், ${devs.length} சாதனங்களில் ${online} ஆன்லைன், பாதுகாப்பு மதிப்பெண் ${I.score == null ? 'n/a' : I.score + '/100'}.`);
+  if (has(/how are you|how r u|how do you do|how's it going|சுகமா|எப்படி இருக்க|நலமா|epdi irukka|eppadi irukkeenga/)) { kind = 'chat'; ans = L('I am doing great, thanks for asking! I never sleep, so your network is covered. ', 'நான் நன்றாக இருக்கிறேன், கேட்டதற்கு நன்றி! நான் தூங்குவதில்லை, உங்கள் நெட்வொர்க் பாதுகாப்பில் உள்ளது. ') + live; }
+  else if (has(/who are you|your name|what can you do|what are you|உன் பெயர|நீ யார்|நீங்கள் யார்|என்ன செய்வாய்/)) { kind = 'chat'; ans = L('I am NetGuard Copilot, the assistant built into NetGuard AI. I read your alerts, devices and blocked addresses, explain attacks in plain words, look up IP addresses and can block or trust one when you press the button. ', 'நான் NetGuard Copilot, NetGuard AI-இல் உள்ள உதவியாளர். உங்கள் அலெர்ட்கள், சாதனங்கள், தடுக்கப்பட்ட முகவரிகளைப் படித்து எளிய சொற்களில் விளக்குவேன், IP முகவரிகளைச் சோதிப்பேன், பொத்தானை அழுத்தினால் தடுக்க அல்லது நம்ப உதவுவேன். ') + live; }
+  else if (!ip && has(/latest|last|recent|newest|show.*alert|list.*alert|alerts?\b.*(now|today)|கடைசி|சமீப|அலெர்ட்/) && has(/alert|attack|அலெர்ட்|தாக்க/)) {
+    kind = 'recent';
+    const rows = db.prepare('SELECT created,type,severity,src_ip,action FROM alerts WHERE user_id=? AND demo=0 ORDER BY created DESC LIMIT 4').all(u);
+    ans = rows.length ? L('Latest alerts: ', 'சமீபத்திய அலெர்ட்கள்: ') + rows.map((a) => `${a.severity} ${tName(a.type)}${a.src_ip ? ' from ' + a.src_ip : ''}, ${agoL(a.created)}${a.action ? ' (' + String(a.action).slice(0, 50) + ')' : ''}`).join('; ') + '.' : L('There are no real alerts yet. ', 'இதுவரை உண்மையான அலெர்ட்கள் இல்லை. ') + live;
+    rows.filter((a) => a.src_ip).slice(0, 2).forEach((a) => links.push({ label: L('Inspect ' + a.src_ip, a.src_ip + '-ஐ ஆராய்'), href: '#/tools?ip=' + a.src_ip }));
+    links.push({ label: L('Open Alerts', 'Alerts-ஐத் திற'), href: '#/alerts' });
+  }
+  else if (has(/^(hi|hello|hey|vanakkam)\b|வணக்கம்|ஹாய்/)) { kind = 'greet'; ans = live + ' ' + L('Hello! I am NetGuard Copilot. Ask me about your security in plain words, in English or Tamil.', 'வணக்கம்! நான் NetGuard Copilot. உங்கள் பாதுகாப்பைப் பற்றி எளிய தமிழிலோ ஆங்கிலத்திலோ கேளுங்கள்.'); }
   else if (has(/thank|நன்றி|nandri/)) { kind = 'thanks'; ans = L('You are welcome! Stay safe.', 'நன்றி! பாதுகாப்பாக இருங்கள்.'); }
   else if (has(/lockdown|லாக்டவுன்/)) {
     const off = has(/\boff\b|disable|stop|அணை|நிறுத்து/);
@@ -656,8 +730,14 @@ function copilotAnswer(u, rawQ, lang) {
     links.push({ label: L('Open full incident report', 'முழு அறிக்கையைத் திற'), href: '#/report' });
   }
   else {
-    ans = L('I can answer from your own data and do actions for you. Try: "Am I safe?", "What happened today?", "Who is attacking me?", "What should I do?", "What is a port scan?", "How do I add a device?", "lockdown on", "block 203.0.113.5", or paste an IP address. You can also write in Tamil.',
-      'உங்கள் தரவிலிருந்து பதில் சொல்லவும், செயல்களைச் செய்யவும் முடியும். கேளுங்கள்: "நான் பாதுகாப்பாக இருக்கிறேனா?", "இன்று என்ன நடந்தது?", "என்னை யார் தாக்குகிறார்கள்?", "நான் என்ன செய்ய வேண்டும்?", "போர்ட் ஸ்கேன் என்றால் என்ன?", "சாதனத்தை எப்படிச் சேர்ப்பது?", "lockdown on", "block 203.0.113.5", அல்லது ஒரு IP முகவரியை ஒட்டுங்கள்.');
+    // Unknown wording: still answer from live data and suggest what is useful right now, instead of repeating a fixed list.
+    const tips = [];
+    if (openAlerts) tips.push(L('"What happened today?"', '"இன்று என்ன நடந்தது?"'));
+    if (I.attackers.some((a) => !a.blocked)) tips.push(L('"Who is attacking me?"', '"யார் தாக்குகிறார்கள்?"'));
+    if (I.score != null && I.score < 85) tips.push(L('"What should I do?"', '"நான் என்ன செய்ய வேண்டும்?"'));
+    if (!devs.length) tips.push(L('"How do I add a device?"', '"சாதனத்தை எப்படி சேர்ப்பது?"'));
+    tips.push(L('paste any IP address to check it', 'எந்த IP-யையும் ஒட்டி சோதிக்கலாம்'), L('"What is a port scan?"', '"Port scan என்றால் என்ன?"'));
+    ans = L(`I did not fully catch "${String(rawQ).slice(0, 60)}", but here is where things stand. `, `"${String(rawQ).slice(0, 60)}" என்பதை நான் முழுமையாகப் புரிந்துகொள்ளவில்லை, ஆனால் நிலை இதோ. `) + live + L(' You could ask: ', ' இவற்றைக் கேட்கலாம்: ') + tips.slice(0, 4).join(', ') + '.';
   }
   return { answer: ans, links, actions, lang: ta ? 'ta' : 'en', kind };
 }
@@ -700,10 +780,15 @@ async function aiAnswer(u, question, lang, history) {
   let raw;
   if (provider === 'gemini') {
     const base = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com', model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY }, signal: AbortSignal.timeout(25000),
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: turns.map((t) => ({ role: t.role === 'assistant' ? 'model' : 'user', parts: [{ text: t.text }] })), generationConfig: { temperature: 0.4, maxOutputTokens: 900, responseMimeType: 'application/json' } }),
-    });
+    const key = String(process.env.GEMINI_API_KEY);
+    // Standard keys (AIza...) go in x-goog-api-key. Keys that start with "AQ." are OAuth-style tokens: they are tried as a Bearer token too.
+    const attempts = key.startsWith('AQ.') ? [{ 'x-goog-api-key': key }, { Authorization: 'Bearer ' + key }] : [{ 'x-goog-api-key': key }];
+    const body = JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: turns.map((t) => ({ role: t.role === 'assistant' ? 'model' : 'user', parts: [{ text: t.text }] })), generationConfig: { temperature: 0.4, maxOutputTokens: 900, responseMimeType: 'application/json' } });
+    let r;
+    for (const h of attempts) {
+      r = await fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...h }, signal: AbortSignal.timeout(25000), body });
+      if (r.ok || ![400, 401, 403].includes(r.status)) break; // only a rejected credential justifies trying the other style
+    }
     if (!r.ok) throw new Error('AI service error ' + r.status);
     const j = await r.json(); raw = (((j.candidates || [])[0] || {}).content || {}).parts; raw = raw && raw.map((p) => p.text || '').join('');
   } else {
@@ -736,10 +821,22 @@ route('POST', '/api/copilot', 'user', async (req, res, ctx) => {
   }
   if (lang === 'both') {
     const en = copilotAnswer(ctx.user.id, question, 'en'), ta = copilotAnswer(ctx.user.id, question, 'ta');
+    await withGeo(en, question, 'en'); await withGeo(ta, question, 'ta');
     return send(res, 200, { answer: en.answer + '\n\n' + ta.answer, links: en.links, actions: en.actions, lang: 'both', kind: en.kind, ai: null });
   }
-  send(res, 200, { ...copilotAnswer(ctx.user.id, question, lang), ai: null });
+  const out = { ...copilotAnswer(ctx.user.id, question, lang), ai: null };
+  await withGeo(out, question, lang);
+  send(res, 200, out);
 });
+// An IP in the question gets a live location line (ipwho.is, cached, server-side). Never blocks the answer for long.
+async function withGeo(out, question, lang) {
+  const m = String(question).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/), ip = m && cleanIp(m[0]);
+  if (!ip || out.kind !== 'ip') return;
+  try {
+    const g = await Promise.race([geo.lookup(ip, false), new Promise((r) => setTimeout(() => r(null), 3500))]);
+    if (g && !g.error && !g.private && g.country) out.answer += (out.lang === 'ta' ? ` இடம்: ${g.city || '?'}, ${g.country}` : ` Location: ${g.city || 'unknown city'}, ${g.country}`) + (g.isp || g.org ? ` (${g.isp || g.org}${g.asn ? ', ' + g.asn : ''}).` : '.');
+  } catch { /* location is a bonus */ }
+}
 
 // ------------------------------------------------------------------ simulator
 route('POST', '/api/sim/attack', 'user', async (req, res, ctx) => {
@@ -780,8 +877,18 @@ function triggerCanary(c, ip, ua) {
   if (why) action = `Not blocked: ${why}`;
   else if (cfg.auto_block) { engine.addBlock(u, { ip, reason: title, source: 'auto', scope: 'fleet', alertId: id, ttlMin: cfg.block_ttl_min }); action = `Blocked ${ip} on all your devices`; }
   db.prepare('UPDATE alerts SET action=? WHERE id=?').run(action, id);
-  hub.emit(u, 'alert', engine.publicAlert(db.prepare('SELECT * FROM alerts WHERE id=?').get(id)));
+  const arow = db.prepare('SELECT * FROM alerts WHERE id=?').get(id);
+  hub.emit(u, 'alert', engine.publicAlert(arow));
   engine.log(u, null, 'CRIT', `${title} | ${action}`);
+  geo.lookup(ip, false).then((g) => { // location for the World Map; never blocks the trap response
+    if (!g || g.error || g.private) return;
+    const r2 = db.prepare('SELECT detail FROM alerts WHERE id=?').get(id); if (!r2) return;
+    let d = {}; try { d = JSON.parse(r2.detail) || {}; } catch { /* keep empty */ }
+    d.geo = { country: g.country, country_code: g.country_code, city: g.city, region: g.region, lat: g.lat, lon: g.lon, isp: g.isp, asn: g.asn, org: g.org };
+    db.prepare('UPDATE alerts SET detail=? WHERE id=?').run(JSON.stringify(d), id);
+    hub.emit(u, 'alert_update', { id, updated: now(), detail: d });
+  }).catch(() => {});
+  try { require('./alertmail').notify(arow, null); } catch { /* e-mail is best effort */ }
 }
 
 
@@ -816,6 +923,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/stream') {
       const user = auth.userFromRequest(req);
       if (!user) return send(res, 401, { error: 'Sign in required' });
+      if (user.locked) return send(res, 423, { error: 'Session locked', locked: true });
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no', ...HEADERS });
       res.write('retry: 3000\n\n');
       hub.addClient(user.id, res);
@@ -831,11 +939,18 @@ const server = http.createServer(async (req, res) => {
       if (r.mode === 'user') {
         ctx.user = auth.userFromRequest(req);
         if (!ctx.user) throw bad('Sign in required', 401);
+        if (ctx.user.locked && !['/api/auth/unlock', '/api/auth/logout', '/api/auth/me', '/api/me', '/api/auth/lock'].includes(url.pathname)) return send(res, 423, { error: 'Session locked', locked: true });
         if (req.method !== 'GET' && req.headers['x-requested-with'] !== 'NetGuard') throw bad('Missing CSRF header', 403);
         if (ctx.user.read_only && req.method !== 'GET' && !['/api/auth/logout', '/api/auth/unlock', '/api/copilot'].includes(url.pathname)) throw bad('This is the read-only sandbox. Create your own account to change things.', 403);
       } else if (r.mode === 'agent') {
+        // Wrong keys are counted per address (30 per minute); a busy address cannot be used to guess keys.
+        const af = agentFails.get(ip);
+        if (af && af.reset > now() && af.n >= 30) throw bad('Too many invalid API keys from this address. Wait a minute.', 429);
         ctx.device = auth.deviceFromRequest(req);
-        if (!ctx.device) throw bad('Invalid or missing API key', 401);
+        if (!ctx.device) {
+          if (!af || af.reset < now()) agentFails.set(ip, { n: 1, reset: now() + 60000 }); else af.n += 1;
+          throw bad('Invalid or missing API key', 401);
+        }
       } else if (r.mode === 'public' && req.method !== 'GET' && req.headers['x-requested-with'] !== 'NetGuard') {
         throw bad('Missing CSRF header', 403);
       }
@@ -969,4 +1084,4 @@ if (require.main === module) {
   const stop = () => { server.close(); process.exit(0); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
 }
-module.exports = { server };
+module.exports = { server, _test: { clientIp } };

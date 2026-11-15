@@ -21,12 +21,13 @@ async function postJson(url, headers, body) {
 }
 const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 // dark-themed HTML body that shows the 6-digit code in large bold text
-const codeHtml = (code) => `<div style="background:#171717;padding:32px;font-family:Arial,sans-serif;color:#f2f2f2"><div style="max-width:420px;margin:auto;border:1px solid #3a3a3a;border-radius:12px;padding:28px;background:#1f1f1f;text-align:center"><div style="font-size:13px;letter-spacing:3px;color:#FFF21A">NETGUARD AI</div><p style="color:#cfcfcf">Your 6-digit verification code is</p><div style="font-size:40px;font-weight:700;letter-spacing:10px;color:#FFF21A;margin:14px 0">${esc(code)}</div><p style="color:#9a9a9a;font-size:13px">It expires in 10 minutes. If you did not create this account, ignore this e-mail.</p></div></div>`;
-async function sendCode(to, code) {
-  const subject = 'NetGuard AI — Your 6-Digit Verification Code';
-  const text = `Your NetGuard AI verification code is ${code}. It expires in 10 minutes. If you did not create this account, ignore this e-mail.`;
-  if (provider() === 'brevo') return postJson('https://api.brevo.com/v3/smtp/email', { 'api-key': process.env.BREVO_API_KEY }, { sender: { name: 'NetGuard AI', email: from() }, to: [{ email: to }], subject, textContent: text, htmlContent: codeHtml(code) });
-  if (provider() === 'resend') return postJson('https://api.resend.com/emails', { Authorization: 'Bearer ' + process.env.RESEND_API_KEY }, { from: `NetGuard AI <${from()}>`, to: [to], subject, text, html: codeHtml(code) });
+const codeHtml = (code, kind) => `<div style="background:#171717;padding:32px;font-family:Arial,sans-serif;color:#f2f2f2"><div style="max-width:420px;margin:auto;border:1px solid #3a3a3a;border-radius:12px;padding:28px;background:#1f1f1f;text-align:center"><div style="font-size:13px;letter-spacing:3px;color:#FFF21A">NETGUARD AI</div><p style="color:#cfcfcf">${kind === 'reset' ? 'Your 6-digit password reset code is' : 'Your 6-digit verification code is'}</p><div style="font-size:40px;font-weight:700;letter-spacing:10px;color:#FFF21A;margin:14px 0">${esc(code)}</div><p style="color:#9a9a9a;font-size:13px">${kind === 'reset' ? 'It expires in 10 minutes. If you did not ask to reset your password, ignore this e-mail and your password stays the same.' : 'It expires in 10 minutes. If you did not create this account, ignore this e-mail.'}</p></div></div>`;
+async function sendCode(to, code, kind = 'verify') {
+  const reset = kind === 'reset';
+  const subject = reset ? 'NetGuard AI — Your Password Reset Code' : 'NetGuard AI — Your 6-Digit Verification Code';
+  const text = reset ? `Your NetGuard AI password reset code is ${code}. It expires in 10 minutes. If you did not ask for this, ignore this e-mail.` : `Your NetGuard AI verification code is ${code}. It expires in 10 minutes. If you did not create this account, ignore this e-mail.`;
+  if (provider() === 'brevo') return postJson('https://api.brevo.com/v3/smtp/email', { 'api-key': process.env.BREVO_API_KEY }, { sender: { name: 'NetGuard AI', email: from() }, to: [{ email: to }], subject, textContent: text, htmlContent: codeHtml(code, kind) });
+  if (provider() === 'resend') return postJson('https://api.resend.com/emails', { Authorization: 'Bearer ' + process.env.RESEND_API_KEY }, { from: `NetGuard AI <${from()}>`, to: [to], subject, text, html: codeHtml(code, kind) });
   if (provider() === 'emailjs') return postJson('https://api.emailjs.com/api/v1.0/email/send', {}, { service_id: process.env.EMAILJS_SERVICE_ID, template_id: process.env.EMAILJS_TEMPLATE_ID, user_id: process.env.EMAILJS_PUBLIC_KEY, ...(process.env.EMAILJS_PRIVATE_KEY ? { accessToken: process.env.EMAILJS_PRIVATE_KEY } : {}), template_params: { to_email: to, email: to, code, verification_code: code, subject, message: text } });
   return send(to, subject, text);
 }

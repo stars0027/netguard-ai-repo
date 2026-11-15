@@ -27,6 +27,7 @@ function createSession(userId) {
   return token;
 }
 function destroySession(token) { db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha256(token)); }
+function setLocked(token, locked) { db.prepare('UPDATE sessions SET locked=? WHERE token_hash=?').run(locked ? 1 : 0, sha256(token)); }
 function destroyUserSessions(userId) { db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId); }
 
 function parseCookies(header) {
@@ -48,9 +49,9 @@ const clearCookieHeader = () => `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; 
 function userFromRequest(req) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (!token) return null;
-  const row = db.prepare(`SELECT u.id,u.email,u.name,u.settings,u.read_only,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(sha256(token));
+  const row = db.prepare(`SELECT u.id,u.email,u.name,u.settings,u.read_only,s.expires,s.locked FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(sha256(token));
   if (!row || row.expires < now()) return null;
-  return { id: row.id, email: row.email, name: row.name, settings: json(row.settings), read_only: !!row.read_only, token };
+  return { id: row.id, email: row.email, name: row.name, settings: json(row.settings), read_only: !!row.read_only, locked: !!row.locked, token };
 }
 
 // ---- device API keys: "ng_<random>", only sha256 stored ----
@@ -78,6 +79,6 @@ setInterval(() => { const t = now(); for (const [k, b] of buckets) if (b.reset <
 setInterval(() => db.prepare('DELETE FROM sessions WHERE expires<?').run(now()), 3600000).unref();
 
 module.exports = {
-  hashPassword, verifyPassword, createSession, destroySession, destroyUserSessions,
+  hashPassword, verifyPassword, setLocked, createSession, destroySession, destroyUserSessions,
   cookieHeader, clearCookieHeader, userFromRequest, deviceFromRequest, newApiKey, rateLimit,
 };

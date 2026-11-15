@@ -63,7 +63,8 @@
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     let data = {}; try { data = await res.json(); } catch { /* empty */ }
-    if (res.status === 401 && path !== '/api/auth/login') { if (S.me) { S.me = null; closeStream(); route(); } }
+    if (res.status === 423 && S.me) { S.me.locked = true; lockScreen(true); }
+    if (res.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/unlock') { if (S.me) { S.me = null; closeStream(); route(); } }
     if (!res.ok) throw new Error(data.error || 'Request failed (' + res.status + ')');
     return data;
   }
@@ -155,7 +156,7 @@
   async function loadAlerts() { try { S.alerts = await api('GET', '/api/alerts?limit=200'); S.alertsState = 'ok'; } catch { S.alertsState = 'error'; } }
   async function loadDemo() { try { [S.demoAlerts, S.demoLogs] = await Promise.all([api('GET', '/api/alerts?demo=1&limit=30'), api('GET', '/api/logs?demo=1&limit=40')]); } catch { /* demo panel just stays empty */ } }
   async function loadInsights() { try { S.ins = await api('GET', '/api/insights'); if (current.insights) current.insights(); } catch { /* ignore */ } }
-  const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', syn_flood: 'SYN flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap' };
+  const TYPE_LABEL = { flood: 'Traffic flood', port_scan: 'Port scan', brute_force: 'Brute force', conn_flood: 'Connection flood', syn_flood: 'SYN flood', exposed_port: 'Exposed service', physical_anomaly: 'Physical event', traffic_drop: 'Traffic drop', device_offline: 'Device offline', canary: 'Canary trap', ot_probe: 'Industrial PLC probe', anomaly: 'Statistical anomaly', heartbeat_lost: 'Agent heartbeat lost' };
   const typeLabel = (t) => TYPE_LABEL[t] || String(t).replace(/_/g, ' ');
   // sound + browser notification when something serious happens (opt-in, remembered per browser)
   const soundOn = () => { try { return localStorage.getItem('ng_sound') === '1'; } catch { return false; } };
@@ -171,7 +172,7 @@
     try { if (document.hidden && 'Notification' in window && Notification.permission === 'granted') new Notification('NetGuard AI: ' + a.title, { body: a.action || a.severity }); } catch { /* ignore */ }
   }
   // spoken alerts in English and Tamil (uses the voices installed on the device; Tamil needs a Tamil voice)
-  const TA_ALERT = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல்', conn_flood: 'இணைப்பு வெள்ளம்', syn_flood: 'SYN வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', canary: 'கேனரி பொறி திறக்கப்பட்டது' };
+  const TA_ALERT = { flood: 'போக்குவரத்து வெள்ளம்', port_scan: 'போர்ட் ஸ்கேன்', brute_force: 'கடவுச்சொல் ஊகித்தல்', conn_flood: 'இணைப்பு வெள்ளம்', syn_flood: 'SYN வெள்ளம்', exposed_port: 'திறந்த சேவை', physical_anomaly: 'உடல் சார்ந்த நிகழ்வு', traffic_drop: 'போக்குவரத்து வீழ்ச்சி', device_offline: 'சாதனம் ஆஃப்லைன்', ot_probe: 'தொழிற்சாலை PLC ஆய்வு', anomaly: 'புள்ளியியல் முரண்பாடு', heartbeat_lost: 'Agent இதயத்துடிப்பு நின்றது', canary: 'கேனரி பொறி திறக்கப்பட்டது' };
   const voiceMode = () => { try { return localStorage.getItem('ng_voice') || 'both'; } catch { return 'both'; } };
   function sayLine(text, lang) {
     const u = new SpeechSynthesisUtterance(text); u.lang = lang; u.rate = 1; u.volume = 0.9;
@@ -290,7 +291,40 @@
       try { const r = await api('POST', '/api/auth/resend-code', { ticket: vticket }); vticket = r.ticket; vmsg.textContent = 'A new code was sent to ' + r.email + '.'; } catch (x) { err.textContent = x.message; } finally { setTimeout(() => { resendBtn.disabled = false; }, 10000); }
     };
     backBtn.onclick = () => { vticket = null; step3.hidden = true; step1.hidden = false; actions.hidden = false; or.hidden = false; sandbox.hidden = false; err.textContent = ''; setMode('login'); };
+    // forgot password: e-mail -> 6-digit reset code -> new password
+    const fEmail = el('input', { type: 'email', autocomplete: 'email' });
+    const fCode = el('input', { type: 'text', inputmode: 'numeric', maxlength: 6, autocomplete: 'one-time-code', placeholder: '6-DIGIT CODE', 'aria-label': '6-digit reset code' });
+    const fpwf = pwField('New password (8+ characters)', { autocomplete: 'new-password' }), fpw = fpwf.input;
+    fpw.required = false; fpw.removeAttribute('minlength'); // this panel lives inside the sign-in form: a hidden required field would block sign-in
+    const fMsg = el('p', { class: 'muted', role: 'status' });
+    const fSend = el('button', { class: 'btn primary', type: 'button' }, 'Send reset code');
+    const fDo = el('button', { class: 'btn primary', type: 'button' }, 'Reset password');
+    const fBack = el('button', { class: 'btn', type: 'button' }, 'Back to sign in');
+    const codeRow = el('div', { class: 'form' }, fCode, fpwf.lbl, fDo); codeRow.hidden = true;
+    const step4 = el('div', { class: 'form' }, el('p', { class: 'muted' }, 'Enter the e-mail address of your account. We will send a 6-digit reset code.'), el('label', {}, 'Email', fEmail), fSend, codeRow, fMsg, fBack); step4.hidden = true;
+    let fticket = null;
+    const forgot = el('button', { class: 'btn sm', type: 'button', style: 'align-self:flex-start' }, 'Forgot password?');
+    function showForgot() {
+      step1.hidden = true; step2.hidden = true; step3.hidden = true; step4.hidden = false; actions.hidden = true; or.hidden = true; sandbox.hidden = true;
+      title.textContent = 'Reset your password'; fEmail.value = email.value; fMsg.textContent = ''; err.textContent = ''; codeRow.hidden = true; fticket = null; fEmail.focus();
+    }
+    forgot.onclick = showForgot;
+    fSend.onclick = async () => {
+      err.textContent = ''; fSend.disabled = true;
+      try { const r = await api('POST', '/api/auth/forgot', { email: fEmail.value.trim().toLowerCase() }); fticket = r.ticket; fMsg.textContent = r.message; codeRow.hidden = false; fSend.textContent = 'Send a new code'; fCode.focus(); }
+      catch (x) { err.textContent = x.message; } finally { setTimeout(() => { fSend.disabled = false; }, 4000); }
+    };
+    fDo.onclick = async () => {
+      err.textContent = ''; fDo.disabled = true;
+      try {
+        await api('POST', '/api/auth/reset', { ticket: fticket, code: fCode.value, password: fpw.value });
+        fMsg.textContent = 'Password updated. Sign in with your new password.'; email.value = fEmail.value; pw.value = ''; fCode.value = ''; fpw.value = '';
+        setTimeout(() => fBack.onclick(), 1500);
+      } catch (x) { err.textContent = x.message; } finally { fDo.disabled = false; }
+    };
+    fBack.onclick = () => { step4.hidden = true; step1.hidden = false; actions.hidden = false; or.hidden = false; sandbox.hidden = false; err.textContent = ''; setMode('login'); };
     function setMode(m) {
+      forgot.hidden = m !== 'login';
       mode = m; nameLbl.hidden = m === 'login'; pinLbl.hidden = m === 'login'; inviteLbl.hidden = !(m === 'signup' && signupMode === 'invite');
       title.textContent = m === 'login' ? 'Sign in' : 'Create your account';
       submit.textContent = m === 'login' ? 'Sign in' : 'Create account';
@@ -313,10 +347,10 @@
         await boot(); location.hash = '#/dashboard';
       } catch (x) { err.textContent = x.message; } finally { submit.disabled = false; }
     } }, title,
-      step1, step2, step3, err, actions,
+      step1, step2, step3, step4, err, actions,
       or, sandbox,
       el('p', { class: 'foot', style: 'margin-top:12px' }, el('a', { href: '/privacy.html' }, 'Privacy'), ' · ', el('a', { href: '#pubInfo', onclick: (e) => { e.preventDefault(); const t = document.getElementById('pubInfo'); if (t) t.scrollIntoView({ behavior: 'smooth' }); } }, 'About')));
-    step1.append(nameLbl, el('label', {}, 'Email', email), pwf.lbl, pinLbl, inviteLbl);
+    step1.append(nameLbl, el('label', {}, 'Email', email), pwf.lbl, forgot, pinLbl, inviteLbl);
     step2.append(el('p', { class: 'muted' }, 'Enter the code from your security PIN, authenticator app, or e-mail to finish signing in.'), codeLbl);
     code.required = false; email.required = true;
     setMode('login');
@@ -419,29 +453,36 @@
   // ---- privacy shield: lock screen (manual button + 10 minutes without activity)
   let lockTimer = null, lockEl = null;
   const IDLE_MS = 10 * 60 * 1000;
-  const isLocked = () => { try { return sessionStorage.getItem('ng_locked') === '1'; } catch { return false; } };
+  // The lock lives on the SERVER (session.locked). Clearing browser storage or refreshing cannot remove it.
+  const isLocked = () => !!(S.me && S.me.locked) || !!lockEl;
   function armIdle() {
     clearTimeout(lockTimer);
-    if (S.me && !S.me.sandbox && !isLocked()) lockTimer = setTimeout(lockScreen, IDLE_MS);
+    if (S.me && !S.me.sandbox && !isLocked()) lockTimer = setTimeout(() => lockScreen(), IDLE_MS);
   }
   ['mousemove', 'keydown', 'click', 'touchstart'].forEach((ev) => document.addEventListener(ev, () => { if (!lockEl) armIdle(); }, { passive: true }));
-  function lockScreen() {
+  function lockScreen(alreadyLocked) {
     if (lockEl || !S.me) return;
-    try { sessionStorage.setItem('ng_locked', '1'); } catch { /* ignore */ }
+    if (alreadyLocked !== true) api('POST', '/api/auth/lock', {}).catch(() => {});
+    S.me.locked = true;
     const secret = el('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Password or 4-digit PIN', 'aria-label': 'Password or PIN' });
     const msg = el('p', { class: 'err', role: 'alert' });
     const go = async (e) => {
       e.preventDefault(); msg.textContent = '';
-      try { await api('POST', '/api/auth/unlock', { secret: secret.value }); unlockScreen(); } catch (x) { msg.textContent = x.message; secret.value = ''; }
+      try { await api('POST', '/api/auth/unlock', { secret: secret.value }); await unlockScreen(); } catch (x) { msg.textContent = x.message; secret.value = ''; }
     };
     lockEl = el('div', { class: 'lockshield', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Screen locked' },
       el('form', { class: 'lockbox', onsubmit: go }, svg(SHIELD, 44), el('h2', {}, 'Screen locked'), el('p', { class: 'muted' }, 'Live data is hidden. Enter your password or PIN to continue.'), secret, msg, el('button', { class: 'btn primary', type: 'submit' }, 'Unlock'),
-        el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}).catch(() => {}); unlockScreen(); closeStream(); S.me = null; route(); } }, 'Sign out instead')));
+        el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}).catch(() => {}); S.pendingLoad = false; if (S.me) S.me.locked = false; await unlockScreen(); closeStream(); S.me = null; route(); } }, 'Sign out instead')));
     document.body.append(lockEl); $app.classList.add('blurred'); secret.focus();
   }
-  function unlockScreen() {
-    try { sessionStorage.removeItem('ng_locked'); } catch { /* ignore */ }
+  async function unlockScreen() {
+    if (S.me) S.me.locked = false;
     if (lockEl) { lockEl.remove(); lockEl = null; } $app.classList.remove('blurred'); armIdle();
+    if (S.pendingLoad) { // the page was refreshed while locked: nothing was loaded yet
+      S.pendingLoad = false;
+      try { await Promise.all([loadDevices(), loadAlerts(), refreshStats()]); } catch { /* shown as an error state */ }
+      S.logs = []; openStream(); route();
+    }
   }
 
   function shell(view, active) {
@@ -467,7 +508,7 @@
       el('div', { class: 'hdr-right' },
         el('span', { class: 'link' }, svg(ICON.wifi, 16), el('i', { class: 'led wait', id: 'linkLed' }), el('span', { id: 'linkText' }, 'Connecting…')),
         el('button', { class: 'btn sm', type: 'button', 'aria-pressed': String(soundOn()), title: 'Alarm sound and notification for serious alerts', onclick: (e) => toggleSound(e.currentTarget) }, soundOn() ? 'Sound on' : 'Sound off'),
-        S.me.sandbox ? null : el('button', { class: 'btn sm', type: 'button', title: 'Hide the screen until you enter your password or PIN', onclick: lockScreen }, svg(ICON.lock, 15), ' Lock'),
+        S.me.sandbox ? null : el('button', { class: 'btn sm', type: 'button', title: 'Hide the screen until you enter your password or PIN', onclick: () => lockScreen() }, svg(ICON.lock, 15), ' Lock'),
         el('button', { class: 'btn sm kbd', type: 'button', title: 'Command palette', onclick: openPalette }, 'Ctrl+K'),
         el('span', { class: 'userbadge', title: S.me.email }, (S.me.name || S.me.email).slice(0, 18)),
         el('button', { class: 'btn sm', type: 'button', onclick: async () => { await api('POST', '/api/auth/logout', {}); closeStream(); S.me = null; route(); } }, 'Sign out')));
@@ -871,6 +912,8 @@
         num('learn_samples', 'Learning samples', '~2 s each'),
         num('src_pps_limit', 'Flood limit per source', 'packets/s'), num('conn_limit', 'Connection limit per source'),
         num('port_scan_ports', 'Port-scan threshold', 'distinct ports in 30 s'), num('brute_force_attempts', 'Brute-force threshold', 'failed logins in 60 s'),
+        el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'email_alerts', checked: s.email_alerts !== false }), 'E-mail me critical and high alerts for my real devices'),
+        el('p', { class: 'muted small' }, 'Sent to your verified account e-mail with the device, attack type, source IP, location, targeted ports and firewall status. At most one e-mail per source address every 15 minutes.'),
         el('label', {}, 'Alert webhook URL (Slack, Discord or any JSON endpoint)', el('input', { type: 'url', name: 'webhook_url', value: s.webhook_url, placeholder: 'https://hooks.slack.com/services/…' })),
         msg,
         el('div', { class: 'inline' },
@@ -881,7 +924,7 @@
       e.preventDefault(); msg.textContent = '';
       const fd = new FormData(f), body = {};
       for (const [k, v] of fd.entries()) body[k] = ['webhook_url', 'block_scope', 'sensitivity'].includes(k) ? v : Number(v);
-      body.auto_block = f.elements.auto_block.checked;
+      body.auto_block = f.elements.auto_block.checked; body.email_alerts = f.elements.email_alerts.checked;
       try {
         try { await api('PUT', '/api/settings', body); }
         catch (x) {
@@ -1342,9 +1385,8 @@
   async function boot() {
     try { S.me = await api('GET', '/api/me'); } catch { S.me = null; }
     if (S.me) {
-      if (isLocked()) setTimeout(lockScreen, 0); else armIdle();
-      await Promise.all([loadDevices(), loadAlerts(), refreshStats()]);
-      S.logs = []; openStream();
+      if (S.me.locked) { S.pendingLoad = true; setTimeout(() => lockScreen(true), 0); } // refresh while locked stays locked
+      else { armIdle(); await Promise.all([loadDevices(), loadAlerts(), refreshStats()]); S.logs = []; openStream(); }
     }
     route();
   }
