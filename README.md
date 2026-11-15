@@ -137,3 +137,7 @@ Without a key the built-in rule-based assistant is used.
 ## v21 notes
 - 2-step sign-in by e-mail code now works through the mail service (Brevo/Resend/EmailJS/SMTP); raw `SMTP_EMAIL` is no longer required.
 - Canary Trap hits are located with the geo lookup (shown on the World Map) and e-mail the owner right away (Brevo/Resend/SMTP).
+
+## v22 notes
+- **Tamil voice without a Tamil voice installed:** Copilot "Read answers aloud" checks the computer for a `ta` voice. If none exists, Tamil text is split into chunks of at most 180 characters and played from `GET /api/tts` (server fetches the MP3 from Google Translate TTS, 90 requests/min per user, cached). The text of the spoken answer is sent to Google for this. `TTS_BASE` overrides the host. Unchecking "Read answers aloud" or pressing Stop ends the audio.
+- **`AQ.` Gemini keys:** tried on the Vertex AI Express endpoint first (`VERTEX_BASE` overrides), then the Generative Language endpoint (`?key=` + Bearer, then `x-goog-api-key`). `GET /api/copilot/status` now also returns `ai_error` (last Google status/message, key removed).

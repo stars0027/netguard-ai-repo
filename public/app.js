@@ -1014,19 +1014,49 @@
     const history = []; let readAloud = true, convo = false, rec = null, busy = false;
     api('GET', '/api/copilot/status').then((r) => { badge.textContent = r.ai ? 'AI: ' + (r.ai === 'gemini' ? 'Gemini' : 'Claude') : 'Basic mode'; badge.dataset.ai = r.ai ? '1' : '0'; badge.title = r.ai ? 'Real AI is on' : 'Add GEMINI_API_KEY on the server to turn on the full AI'; basicCard.hidden = !!r.ai; }).catch(() => { badge.textContent = 'Status unknown'; });
     // speak() resolves when the voice finishes, so the hands-free loop knows when to listen again
+    let ttsAudio = null, ttsRun = 0;
+    const stopVoice = () => { ttsRun++; try { if (ttsAudio) { ttsAudio.pause(); ttsAudio.src = ''; ttsAudio = null; } } catch { /* ignore */ } try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch { /* ignore */ } };
+    const chunkText = (t) => { // sentence-sized pieces of at most 180 characters
+      const out = []; let cur = '';
+      for (const s of String(t).replace(/\s+/g, ' ').split(/(?<=[.!?।])\s+/)) {
+        if ((cur + ' ' + s).trim().length <= 180) { cur = (cur + ' ' + s).trim(); continue; }
+        if (cur) out.push(cur); cur = '';
+        let rest = s; while (rest.length > 180) { let k = rest.lastIndexOf(' ', 180); if (k < 60) k = 180; out.push(rest.slice(0, k).trim()); rest = rest.slice(k).trim(); }
+        cur = rest;
+      }
+      if (cur) out.push(cur); return out.filter(Boolean);
+    };
+    const playServerVoice = (text, l, run) => new Promise((resolve) => { // Tamil / English audio from the server, one chunk after another
+      const chunks = chunkText(text); let n = 0;
+      const next = () => {
+        if (run !== ttsRun || n >= chunks.length) return resolve();
+        const a = new Audio('/api/tts?lang=' + l + '&q=' + encodeURIComponent(chunks[n++])); ttsAudio = a;
+        a.onended = next; a.onerror = () => resolve();
+        a.play().catch(() => resolve());
+      };
+      next();
+    });
+    // speak() resolves when the voice finishes, so the hands-free loop knows when to listen again
     const speak = (text, lang) => new Promise((resolve) => {
       try {
-        if (!readAloud || !('speechSynthesis' in window)) return resolve();
-        speechSynthesis.cancel();
-        const parts = lang === 'both' ? text.split('\n\n') : [text], voices = speechSynthesis.getVoices();
-        parts.forEach((t, i) => {
-          const l = lang === 'both' ? (i === 0 ? 'en' : 'ta') : (lang === 'ta' || /[஀-௿]/.test(t) ? 'ta' : 'en');
-          const u = new SpeechSynthesisUtterance(t); u.lang = l === 'ta' ? 'ta-IN' : 'en-IN';
-          const v = voices.find((x) => x.lang && x.lang.toLowerCase().startsWith(l)); if (v) u.voice = v;
-          if (i === parts.length - 1) { u.onend = resolve; u.onerror = resolve; }
-          speechSynthesis.speak(u);
-        });
-        setTimeout(resolve, 45000);
+        if (!readAloud) return resolve();
+        stopVoice(); const run = ttsRun;
+        const parts = lang === 'both' ? text.split('\n\n') : [text], hasSynth = 'speechSynthesis' in window, voices = hasSynth ? speechSynthesis.getVoices() : [];
+        const hasTa = voices.some((x) => x.lang && x.lang.toLowerCase().startsWith('ta'));
+        const jobs = parts.map((t, i) => ({ t, l: lang === 'both' ? (i === 0 ? 'en' : 'ta') : (lang === 'ta' || /[஀-௿]/.test(t) ? 'ta' : 'en') }));
+        (async () => {
+          for (const jb of jobs) {
+            if (run !== ttsRun) return;
+            if (jb.l === 'ta' && !hasTa) { await playServerVoice(jb.t, 'ta', run); continue; } // no Tamil voice on this computer
+            if (!hasSynth) continue;
+            await new Promise((done) => {
+              const u = new SpeechSynthesisUtterance(jb.t); u.lang = jb.l === 'ta' ? 'ta-IN' : 'en-IN';
+              const v = voices.find((x) => x.lang && x.lang.toLowerCase().startsWith(jb.l)); if (v) u.voice = v;
+              u.onend = done; u.onerror = done; speechSynthesis.speak(u); setTimeout(done, 45000);
+            });
+          }
+        })().then(resolve, resolve);
+        setTimeout(resolve, 90000);
       } catch { resolve(); }
     });
     const runAction = async (ac, btn) => {
@@ -1083,21 +1113,21 @@
         talkBtn.classList.add('live');
         rec.onresult = (e) => { const t = e.results[0][0].transcript; input.value = t; ask(t); };
         rec.onerror = (e) => { talkBtn.classList.remove('live'); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { convo = false; paintUi(false); toast('Allow the microphone to talk to Copilot', true); } else if (convo && !busy) setTimeout(listen, 800); };
-        rec.onend = () => { talkBtn.classList.remove('live'); if (convo && !busy && !speechSynthesis.speaking) setTimeout(listen, 500); };
+        rec.onend = () => { talkBtn.classList.remove('live'); if (convo && !busy && !speechSynthesis.speaking && !(ttsAudio && !ttsAudio.paused && !ttsAudio.ended)) setTimeout(listen, 500); };
         rec.start();
       } catch { convo = false; paintUi(false); }
     }
     const talkBtn = el('button', { class: 'btn talk', type: 'button', 'aria-label': 'Talk to Copilot' });
     talkBtn.onclick = () => {
       if (!SR) { toast('Voice input needs Chrome or Edge', true); return; }
-      convo = !convo; if (!convo) { try { rec && rec.abort(); } catch { /* ignore */ } try { speechSynthesis.cancel(); } catch { /* ignore */ } talkBtn.classList.remove('live'); } else { readAloud = true; readChk.checked = true; listen(); }
+      convo = !convo; if (!convo) { try { rec && rec.abort(); } catch { /* ignore */ } stopVoice(); talkBtn.classList.remove('live'); } else { readAloud = true; readChk.checked = true; listen(); }
       paintUi(false);
     };
     const langSel = el('select', { 'aria-label': 'Language', onchange: (e) => { try { localStorage.setItem('ng_lang', e.target.value); } catch { /* ignore */ } paintUi(false); } },
       el('option', { value: 'both' }, 'English + தமிழ்'), el('option', { value: 'auto' }, 'Auto'), el('option', { value: 'en' }, 'English'), el('option', { value: 'ta' }, 'தமிழ்'));
     langSel.value = getLang();
-    const readChk = el('input', { type: 'checkbox', checked: true, onchange: (e) => { readAloud = e.target.checked; if (!readAloud && 'speechSynthesis' in window) speechSynthesis.cancel(); } });
-    current = { cleanup: () => { convo = false; try { rec && rec.abort(); } catch { /* ignore */ } try { speechSynthesis.cancel(); } catch { /* ignore */ } } };
+    const readChk = el('input', { type: 'checkbox', checked: true, onchange: (e) => { readAloud = e.target.checked; if (!readAloud) stopVoice(); } });
+    current = { cleanup: () => { convo = false; try { rec && rec.abort(); } catch { /* ignore */ } stopVoice(); } };
     paintUi(true);
     return el('section', { class: 'view grid' }, el('div', { class: 'panel pad copilot' },
       el('div', { class: 'head' }, el('h2', {}, 'AI Copilot'), el('span', { class: 'meta' }, badge, el('label', { class: 'check', style: 'margin:0 10px' }, readChk, ui().read), el('span', { style: 'margin-right:6px' }, 'Language'), langSel)),
