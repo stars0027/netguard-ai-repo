@@ -360,6 +360,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const v2b = await call('POST', '/api/auth/verify', { ticket: l2.data.ticket, code: m2.text.match(/\b(\d{6})\b/)[1] });
   ok(v2b.status === 200 && (await call('GET', '/api/me')).status === 200, 'the e-mailed code completes sign-in');
   await call('POST', '/api/security/email', { password: 'v20 user pass 12', on: false });
+  // ---- v23: a quiet laptop's normal traffic is never a flood
+  const dl = (await call('POST', '/api/devices', { name: 'Idle-Laptop' })).data;
+  const tl = (o) => call('POST', '/api/agent/telemetry', { hostname: 'lap', os: 'Windows 11', enforce: false, interval: 2, own_ips: ['192.168.1.5'], agent_version: '2.1', ...o }, { key: dl.api_key });
+  const openFor = async () => (await call('GET', '/api/alerts')).data.filter((x) => x.device_name === 'Idle-Laptop' && x.status !== 'resolved');
+  for (let i = 0; i < 30; i++) await tl({ pps: 19 + (i % 3), listening: i === 0 ? [{ addr: '0.0.0.0', port: 445, proc: 'System' }] : [] });
+  for (const v of [61, 119, 119, 119, 400]) await tl({ pps: v });
+  await tl({ pps: 15 }); await tl({ pps: 0 }); await tl({ pps: 0 }); await tl({ pps: 0 }); await tl({ pps: 0 });
+  const idleAlerts = await openFor();
+  ok(!idleAlerts.some((x) => x.type === 'flood' || x.type === 'traffic_drop' || x.type === 'exposed_service'), 'idle laptop: 61-400 pkt/s, going quiet and Windows SMB 445 raise no alerts');
+  await tl({ pps: 5000 }); await tl({ pps: 5000 }); await tl({ pps: 5000 });
+  ok(!(await openFor()).some((x) => x.type === 'flood'), 'a high packet rate with no external source and no half-open connections is not a flood');
+  await tl({ pps: 5000, syn_recv: { '198.51.100.99': 200 } }); await tl({ pps: 5000, syn_recv: { '198.51.100.99': 200 } });
+  ok((await openFor()).some((x) => x.type === 'flood' || x.type === 'syn_flood'), 'a real inbound flood is still caught');
   // ---- 4. OT ports, anomaly, dead-man
   await t2({ pps: 120, connections: [{ ip: '45.33.32.160', lport: 502, state: 'ESTABLISHED' }] });
   let alr = await call('GET', '/api/alerts'); if (!Array.isArray(alr.data)) console.log('ALERTS?', alr.status, JSON.stringify(alr.data)); let al = alr.data;

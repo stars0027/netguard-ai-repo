@@ -141,3 +141,9 @@ Without a key the built-in rule-based assistant is used.
 ## v22 notes
 - **Tamil voice without a Tamil voice installed:** Copilot "Read answers aloud" checks the computer for a `ta` voice. If none exists, Tamil text is split into chunks of at most 180 characters and played from `GET /api/tts` (server fetches the MP3 from Google Translate TTS, 90 requests/min per user, cached). The text of the spoken answer is sent to Google for this. `TTS_BASE` overrides the host. Unchecking "Read answers aloud" or pressing Stop ends the audio.
 - **`AQ.` Gemini keys:** tried on the Vertex AI Express endpoint first (`VERTEX_BASE` overrides), then the Generative Language endpoint (`?key=` + Bearer, then `x-goog-api-key`). `GET /api/copilot/status` now also returns `ai_error` (last Google status/message, key removed).
+
+## v23 notes
+- The traffic-spike threshold never goes below `max(src_pps_limit, 500)` pkt/s, so a quiet laptop (baseline ~20 pkt/s) no longer alarms at 60-120 pkt/s.
+- A "from many sources" flood alert needs an identifiable source or real half-open (SYN_RECV) connections. Your own outbound browsing/video no longer counts.
+- No more "traffic dropped" alerts, and Windows SMB (445/139) no longer raises an exposure warning on its own.
+- One-time clean-up on first start: old non-demo `flood` alerts with no source and all `traffic_drop` alerts are deleted.

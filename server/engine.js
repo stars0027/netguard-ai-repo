@@ -261,7 +261,9 @@ function ingest(device, raw, remoteAddr) {
     }
   } else {
     const std = Math.sqrt(st.variance);
-    const thr = Math.max(st.mean + K[cfg.sensitivity] * std, st.mean * MULT[cfg.sensitivity], st.mean + MIN_DELTA[cfg.sensitivity]);
+    // never below a realistic floor: a quiet laptop that learned ~20 pkt/s must not alarm at 60-120 pkt/s of normal background traffic
+    const floor = Math.max(Number(cfg.src_pps_limit) || 500, 500);
+    const thr = Math.max(floor, st.mean + K[cfg.sensitivity] * std, st.mean * MULT[cfg.sensitivity], st.mean + MIN_DELTA[cfg.sensitivity]);
     st.thr = thr;
     if (x > thr) { st.over += 1; anomalous = true; } else {
       st.over = 0;
@@ -271,8 +273,11 @@ function ingest(device, raw, remoteAddr) {
     // sudden drop to ~0: link cut, device crashed, emergency shutdown
     if (st.mean >= 20 && x < st.mean * 0.05) st.low += 1; else st.low = 0;
 
-    if (anomalous && (st.over >= 2 || x > thr * 3)) {
-      const top = topSource(t, x);
+    const top0 = anomalous ? topSource(t, x) : null;
+    const synTotal = Object.values(t.syn_recv || {}).reduce((a, b) => a + b, 0);
+    // with no identifiable external source and no half-open connections, a high packet rate is just the user's own outbound traffic (browser, video, updates)
+    if (anomalous && (st.over >= 2 || x > thr * 3) && (top0 !== null || synTotal >= cfg.syn_recv_limit)) {
+      const top = top0;
       raise(device, {
         type: 'flood', severity: 'critical', src_ip: top ? top.ip : null, blockable: !!top,
         title: `Traffic spike: ${Math.round(x)} pkt/s (normal about ${Math.round(st.mean)})` + (top ? ` from ${top.ip}` : ' from many sources'),
@@ -280,12 +285,7 @@ function ingest(device, raw, remoteAddr) {
         detail: { pps: Math.round(x), baseline_mean: Math.round(st.mean), threshold: Math.round(thr), top_source: top },
       });
     }
-    if (st.low >= 3) {
-      raise(device, {
-        type: 'traffic_drop', severity: 'high', title: `Traffic dropped to ${Math.round(x)} pkt/s (normal about ${Math.round(st.mean)})`,
-        action: 'Check link, power and the device itself.', detail: { pps: Math.round(x), baseline_mean: Math.round(st.mean) },
-      });
-    }
+    // (no 'traffic dropped' alert: an idle laptop is normal, and a quiet link is not an attack)
   }
 
   // ---- 2. per-source detectors ----------------------------------------------------------
@@ -371,7 +371,8 @@ function ingest(device, raw, remoteAddr) {
   // ---- 3. exposure check ----------------------------------------------------------------
   for (const l of t.listening) {
     const wildcard = ['0.0.0.0', '::', '*', ''].includes(l.addr);
-    if (wildcard && RISKY_PORTS[l.port] && !st.warned.has(l.port)) {
+    // Windows always listens on SMB (445/139) for file sharing; that alone is not worth an alert on a clean laptop
+    if (wildcard && RISKY_PORTS[l.port] && !st.warned.has(l.port) && !(/windows/i.test(t.os || device.os || '') && (l.port === 445 || l.port === 139))) {
       st.warned.add(l.port);
       raise(device, {
         type: 'exposed_service', severity: 'medium',

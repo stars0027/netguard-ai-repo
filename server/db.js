@@ -122,6 +122,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS vtickets (
 addCol('ALTER TABLE alerts ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE blocks ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
 addCol('ALTER TABLE logs ADD COLUMN demo INTEGER NOT NULL DEFAULT 0');
+// one-time clean-up of false alerts that older versions raised on normal laptop traffic (real, non-demo data only)
+db.exec('CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY)');
+if (!db.prepare('SELECT 1 FROM migrations WHERE name=?').get('v23_false_alerts')) {
+  db.exec("DELETE FROM alerts WHERE demo=0 AND ((type='flood' AND src_ip IS NULL) OR type='traffic_drop')");
+  db.prepare('INSERT OR IGNORE INTO migrations (name) VALUES (?)').run('v23_false_alerts');
+}
 // Per-device protection mode. Devices that already exist keep working exactly as before ('live');
 // devices created from now on start in 'monitor' (dry run) until the owner switches them on.
 addCol("ALTER TABLE devices ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'");
