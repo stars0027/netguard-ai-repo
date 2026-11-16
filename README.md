@@ -147,3 +147,6 @@ Without a key the built-in rule-based assistant is used.
 - A "from many sources" flood alert needs an identifiable source or real half-open (SYN_RECV) connections. Your own outbound browsing/video no longer counts.
 - No more "traffic dropped" alerts, and Windows SMB (445/139) no longer raises an exposure warning on its own.
 - One-time clean-up on first start: old non-demo `flood` alerts with no source and all `traffic_drop` alerts are deleted.
+
+## v24: autonomous engine
+Detection no longer uses editable thresholds (warm-up 15 samples, 4 sigma above the learned mean, 500 pkt/s floor, instant at 1500, 15-port scan, 6 failed logins). Settings shows live engine stats (`GET /api/ai-engine/status`) and `POST /api/ai-engine/recalibrate` resets the learned baseline.

@@ -25,6 +25,8 @@ const RISKY_PORTS = {
   6379: 'Redis', 27017: 'MongoDB', 9200: 'Elasticsearch', 3306: 'MySQL', 5432: 'PostgreSQL',
   502: 'Modbus/TCP (no authentication)', 20000: 'DNP3', 44818: 'EtherNet/IP', 102: 'Siemens S7',
 };
+// v24: fully autonomous detection. These constants replace the user-editable thresholds, so nobody can break detection (or cause a false-alert storm) by typing small numbers.
+const AUTO = { WARMUP: 15, SIGMA: 4.0, FLOOR_PPS: 500, EXTREME_PPS: 1500, SCAN_PORTS: 15, AUTH_FAILS: 6, SYN_RECV: 50, CONN: 100, EMA_ALPHA: 0.05 };
 const K = { low: 6, medium: 4, high: 3 };
 const MULT = { low: 3, medium: 2.2, high: 1.6 };
 const MIN_DELTA = { low: 150, medium: 80, high: 40 };
@@ -254,7 +256,7 @@ function ingest(device, raw, remoteAddr) {
   if (!st.learned) {
     st.n += 1;
     const d = x - st.mean; st.mean += d / st.n; st.m2 += d * (x - st.mean);
-    if (st.n >= cfg.learn_samples) {
+    if (st.n >= AUTO.WARMUP) {
       st.variance = st.m2 / Math.max(1, st.n - 1);
       st.learned = true;
       log(userId, device.id, 'OK', `${device.name}: baseline learned, normal traffic about ${Math.round(st.mean)} pkt/s`);
@@ -262,12 +264,11 @@ function ingest(device, raw, remoteAddr) {
   } else {
     const std = Math.sqrt(st.variance);
     // never below a realistic floor: a quiet laptop that learned ~20 pkt/s must not alarm at 60-120 pkt/s of normal background traffic
-    const floor = Math.max(Number(cfg.src_pps_limit) || 500, 500);
-    const thr = Math.max(floor, st.mean + K[cfg.sensitivity] * std, st.mean * MULT[cfg.sensitivity], st.mean + MIN_DELTA[cfg.sensitivity]);
+    const thr = Math.max(AUTO.FLOOR_PPS, st.mean + AUTO.SIGMA * std);
     st.thr = thr;
-    if (x > thr) { st.over += 1; anomalous = true; } else {
+    if (x > thr || x >= AUTO.EXTREME_PPS) { st.over += 1; anomalous = true; } else {
       st.over = 0;
-      const a = 0.02, dv = x - st.mean;
+      const a = AUTO.EMA_ALPHA, dv = x - st.mean;
       st.mean += a * dv; st.variance = (1 - a) * (st.variance + a * dv * dv);
     }
     // sudden drop to ~0: link cut, device crashed, emergency shutdown
@@ -276,7 +277,7 @@ function ingest(device, raw, remoteAddr) {
     const top0 = anomalous ? topSource(t, x) : null;
     const synTotal = Object.values(t.syn_recv || {}).reduce((a, b) => a + b, 0);
     // with no identifiable external source and no half-open connections, a high packet rate is just the user's own outbound traffic (browser, video, updates)
-    if (anomalous && (st.over >= 2 || x > thr * 3) && (top0 !== null || synTotal >= cfg.syn_recv_limit)) {
+    if (anomalous && (st.over >= 2 || x > thr * 3) && (top0 !== null || synTotal >= AUTO.SYN_RECV)) {
       const top = top0;
       raise(device, {
         type: 'flood', severity: 'critical', src_ip: top ? top.ip : null, blockable: !!top,
@@ -293,11 +294,11 @@ function ingest(device, raw, remoteAddr) {
 
   for (const s of t.sources) {
     if (ignorable(s.ip)) continue;
-    if (s.pkts >= cfg.src_pps_limit || s.syns >= cfg.src_pps_limit * 0.6) {
+    if (s.pkts >= AUTO.FLOOR_PPS || s.syns >= AUTO.FLOOR_PPS * 0.6) {
       raise(device, {
         type: 'flood', severity: 'critical', src_ip: s.ip, blockable: true,
         title: `Traffic spike: ${Math.round(Math.max(s.pkts, x))} pkt/s from ${s.ip}`,
-        detail: { pkts_per_s: Math.round(s.pkts), syn_per_s: Math.round(s.syns), limit: cfg.src_pps_limit },
+        detail: { pkts_per_s: Math.round(s.pkts), syn_per_s: Math.round(s.syns), limit: AUTO.FLOOR_PPS },
       });
     }
     trackScan(st, s.ip, s.ports, ts);
@@ -310,25 +311,25 @@ function ingest(device, raw, remoteAddr) {
     if (c.lport && (!c.state || ['SYN_RECV', 'TIME_WAIT', 'CLOSE_WAIT', 'NONE'].includes(c.state) || !t.agent_version)) trackScan(st, c.ip, [c.lport], ts);
   }
   for (const [ip, n] of perIp) {
-    if (n >= cfg.conn_limit) {
+    if (n >= AUTO.CONN) {
       raise(device, {
         type: 'conn_flood', severity: 'high', src_ip: ip, blockable: true,
-        title: `${n} simultaneous connections from ${ip} (limit ${cfg.conn_limit})`, detail: { connections: n, limit: cfg.conn_limit },
+        title: `${n} simultaneous connections from ${ip} (limit ${AUTO.CONN})`, detail: { connections: n, limit: AUTO.CONN },
       });
     }
   }
   for (const [ip, ports] of Object.entries(t.scans)) { if (!ignorable(ip)) trackScan(st, ip, ports, ts); }
   for (const [ip, n] of Object.entries(t.syn_recv)) {
-    if (ignorable(ip) || n < cfg.syn_recv_limit) continue;
+    if (ignorable(ip) || n < AUTO.SYN_RECV) continue;
     raise(device, {
       type: 'syn_flood', severity: 'critical', src_ip: ip, blockable: true,
-      title: `SYN flood: ${n} half-open (SYN_RECV) connections from ${ip}`, detail: { syn_recv: n, limit: cfg.syn_recv_limit, state: 'SYN_RECV' },
+      title: `SYN flood: ${n} half-open (SYN_RECV) connections from ${ip}`, detail: { syn_recv: n, limit: AUTO.SYN_RECV, state: 'SYN_RECV' },
     });
   }
   for (const [ip, m] of st.scan) {
     for (const [p, at] of m) if (ts - at > 30000) m.delete(p);
     if (!m.size) { st.scan.delete(ip); continue; }
-    if (m.size >= cfg.port_scan_ports) {
+    if (m.size >= AUTO.SCAN_PORTS) {
       raise(device, {
         type: 'port_scan', severity: 'high', src_ip: ip, blockable: true,
         title: `Port scan: ${ip} probed ${m.size} different ports in 30 s`, detail: { ports: [...m.keys()].sort((a, b) => a - b).slice(0, 60) },
@@ -359,7 +360,7 @@ function ingest(device, raw, remoteAddr) {
     const list = (st.brute.get(ip) || []).filter((e) => ts - e.at < 60000);
     list.push({ at: ts, n }); st.brute.set(ip, list);
     const total = list.reduce((a, e) => a + e.n, 0);
-    if (total >= cfg.brute_force_attempts) {
+    if (total >= AUTO.AUTH_FAILS) {
       raise(device, {
         type: 'brute_force', severity: 'high', src_ip: ip, blockable: true,
         title: `Brute force: ${total} failed logins from ${ip} in 60 s`, detail: { failed_logins: total, window_s: 60 },
@@ -387,7 +388,7 @@ function ingest(device, raw, remoteAddr) {
   hub.emit(userId, 'telemetry', {
     device_id: device.id, ts, pps: Math.round(x), conns: t.connections.length, status: statusOf(st, ts),
     baseline: st.learned ? Math.round(st.mean) : null, threshold: st.thr ? Math.round(st.thr) : null,
-    learning: st.learned ? 1 : Math.min(1, st.n / cfg.learn_samples), power: t.power || null, enforce: t.enforce,
+    learning: st.learned ? 1 : Math.min(1, st.n / AUTO.WARMUP), power: t.power || null, enforce: t.enforce,
   });
   return { ok: true, blocks: desiredBlocks(userId, device.id), interval: t.interval };
 }
@@ -476,7 +477,36 @@ setInterval(sweep, 10000).unref();
 setInterval(() => { try { deadman(); } catch (e) { console.error('deadman:', e.message); } }, 15000).unref();
 setInterval(prune, 3600000).unref();
 
+// Live stats of the autonomous engine, per user (devices play the role of agents).
+function getAgentActivityEngineStats(userId) {
+  const rows = db.prepare('SELECT id, name, status, last_seen FROM devices WHERE user_id=? AND virtual=0').all(userId);
+  const agents = rows.map((d) => {
+    const st = states.get(d.id);
+    const n = st ? st.n : 0, mean = st ? st.mean : 0;
+    const sd = st ? Math.sqrt(st.learned ? st.variance : st.m2 / Math.max(1, n - 1)) : 0;
+    return { id: d.id, name: d.name, status: d.status, last_seen: d.last_seen, samples: n, mean_pps: Math.round(mean), stddev_pps: Math.round(sd), calibrated: n >= AUTO.WARMUP };
+  });
+  const live = agents.filter((a) => a.samples > 0);
+  const totalSamples = agents.reduce((a, b) => a + b.samples, 0);
+  const avg = (k) => (live.length ? Math.round(live.reduce((a, b) => a + b[k], 0) / live.length) : 0);
+  const avgMean = avg('mean_pps'), avgStdDev = avg('stddev_pps');
+  return {
+    engine_mode: 'Autonomous Welford + EMA (alpha = 0.05) Activity Engine', algorithm: 'Welford Online Variance + Exponential Moving Average', autonomous: true,
+    warmup_target: AUTO.WARMUP, burst_floor_pps: AUTO.FLOOR_PPS, total_agents: rows.length, calibrated_agents: agents.filter((a) => a.calibrated).length,
+    total_samples: totalSamples, learned_mean_pps: avgMean, learned_stddev_pps: avgStdDev,
+    adaptive_ceiling_pps: Math.round(avgMean + Math.max(AUTO.SIGMA * avgStdDev, AUTO.FLOOR_PPS)),
+    status: totalSamples >= AUTO.WARMUP ? 'CALIBRATED' : 'LEARNING_WARMUP', agents,
+  };
+}
+// Forget what the engine learned for this user's real devices; it relearns from the next heartbeats.
+function recalibrateUser(userId) {
+  let n = 0;
+  for (const d of db.prepare('SELECT id FROM devices WHERE user_id=? AND virtual=0').all(userId)) { if (states.delete(d.id)) n++; }
+  return n;
+}
+
 module.exports = {
+  getAgentActivityEngineStats, recalibrateUser, AUTO,
   ingest, ingestEvent, addBlock, removeBlock, protectedReason, desiredBlocks, appliedCount, publicAlert, forgetDevice,
   log, stateFor, statusOf, states, deadman,
 };

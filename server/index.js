@@ -489,6 +489,22 @@ route('PUT', '/api/settings', 'user', async (req, res, ctx) => {
   }
   try { send(res, 200, saveSettings(ctx.user.id, ctx.body)); } catch (e) { throw bad(e.message); }
 });
+route('GET', '/api/ai-engine/status', 'user', async (req, res, ctx) => {
+  const st = engine.getAgentActivityEngineStats(ctx.user.id);
+  if (ctx.user.read_only || st.total_agents === 0 || st.total_samples === 0) {
+    // sandbox / no device yet: realistic sample baseline so the card never shows 0 or NaN
+    const mean = 142, sd = 38, n = 48;
+    return send(res, 200, { ...st, demo: true, total_agents: Math.max(1, st.total_agents), calibrated_agents: Math.max(1, st.calibrated_agents), total_samples: n,
+      learned_mean_pps: mean, learned_stddev_pps: sd, adaptive_ceiling_pps: Math.round(mean + Math.max(4 * sd, 500)), status: 'CALIBRATED' });
+  }
+  send(res, 200, { ...st, demo: false });
+});
+route('POST', '/api/ai-engine/recalibrate', 'user', async (req, res, ctx) => {
+  if (ctx.user.read_only) throw bad('Sandbox demo baseline is read-only', 403);
+  engine.recalibrateUser(ctx.user.id);
+  engine.log(ctx.user.id, null, 'INFO', 'Activity baseline was reset by the user. The AI engine is learning a fresh traffic profile.');
+  send(res, 200, { ok: true, message: 'Welford + EMA activity baseline reset. Learning fresh traffic profile (0/15 samples).' });
+});
 route('POST', '/api/settings/test-webhook', 'user', async (req, res, ctx) => {
   const url = getSettings(ctx.user.id).webhook_url;
   if (!url) throw bad('Save a webhook URL first');

@@ -898,20 +898,17 @@
 
   // ------------------------------------------------------------------ settings
   function settingsView() {
+    let curSens = 'medium'; // sensitivity is no longer edited here; only Lockdown changes it
     const f = el('form', { class: 'form' }), msg = el('p', { class: 'err' });
     const pwForm = el('form', { class: 'form' }), pmsg = el('p', { class: 'err' });
     (async () => {
-      const s = await api('GET', '/api/settings');
+      const s = await api('GET', '/api/settings'); curSens = s.sensitivity;
       const num = (k, label, hint) => el('label', {}, label + (hint ? ` (${hint})` : ''), el('input', { type: 'number', name: k, value: s[k], min: 0 }));
       f.append(
         el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'auto_block', checked: s.auto_block }), 'Block attackers automatically'),
         el('p', { class: 'muted small' }, 'Off by default for new accounts. Turning it on asks you to confirm. New devices stay in monitor-only (dry run) mode until you enable live blocking on the Devices page.'),
         el('label', {}, 'Block scope', el('select', { name: 'block_scope' }, [['fleet', 'All my devices'], ['device', 'Only the attacked device']].map(([v, t]) => el('option', { value: v, selected: s.block_scope === v }, t)))),
         num('block_ttl_min', 'Unblock after', 'minutes, 0 = never'),
-        el('label', {}, 'Sensitivity', el('select', { name: 'sensitivity' }, [['low', 'Low (fewer alerts)'], ['medium', 'Medium'], ['high', 'High (more alerts)']].map(([v, t]) => el('option', { value: v, selected: s.sensitivity === v }, t)))),
-        num('learn_samples', 'Learning samples', '~2 s each'),
-        num('src_pps_limit', 'Flood limit per source', 'packets/s'), num('conn_limit', 'Connection limit per source'),
-        num('port_scan_ports', 'Port-scan threshold', 'distinct ports in 30 s'), num('brute_force_attempts', 'Brute-force threshold', 'failed logins in 60 s'),
         el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'email_alerts', checked: s.email_alerts !== false }), 'E-mail me critical and high alerts for my real devices'),
         el('p', { class: 'muted small' }, 'Sent to your verified account e-mail with the device, attack type, source IP, location, targeted ports and firewall status. At most one e-mail per source address every 15 minutes.'),
         el('label', {}, 'Alert webhook URL (Slack, Discord or any JSON endpoint)', el('input', { type: 'url', name: 'webhook_url', value: s.webhook_url, placeholder: 'https://hooks.slack.com/services/…' })),
@@ -922,7 +919,7 @@
     })();
     f.onsubmit = async (e) => {
       e.preventDefault(); msg.textContent = '';
-      const fd = new FormData(f), body = {};
+      const fd = new FormData(f), body = { sensitivity: curSens };
       for (const [k, v] of fd.entries()) body[k] = ['webhook_url', 'block_scope', 'sensitivity'].includes(k) ? v : Number(v);
       body.auto_block = f.elements.auto_block.checked; body.email_alerts = f.elements.email_alerts.checked;
       try {
@@ -940,8 +937,34 @@
     const cur = el('input', { type: 'password', autocomplete: 'current-password' }), nw = el('input', { type: 'password', autocomplete: 'new-password', minlength: 8 });
     pwForm.append(el('label', {}, 'Current password', cur), el('label', {}, 'New password', nw), pmsg, el('button', { class: 'btn', type: 'submit' }, 'Change password'));
     pwForm.onsubmit = async (e) => { e.preventDefault(); pmsg.textContent = ''; try { await api('POST', '/api/auth/password', { current: cur.value, password: nw.value }); cur.value = nw.value = ''; toast('Password changed'); } catch (x) { pmsg.textContent = x.message; } };
+    // v24: autonomous Welford + EMA engine card (replaces the manual threshold inputs)
+    const mv = (id, label) => el('div', { class: 'stat' }, el('div', { class: 'muted small' }, label), el('b', { id, style: 'display:block;font-size:1.15rem;color:var(--yellow,#ffd400)' }, '…'));
+    const bar = el('div', { id: 'ai-eng-progress', style: 'height:100%;width:0%;background:linear-gradient(90deg,#8b5cf6,#ffd400);transition:width .5s' });
+    const setT = (id, t) => { const n = document.getElementById(id); if (n) n.textContent = t; };
+    async function loadSettings() {
+      try {
+        const e = await api('GET', '/api/ai-engine/status');
+        setT('ai-eng-status', e.status === 'CALIBRATED' ? 'CALIBRATED' : 'WARMUP LEARNING');
+        setT('ai-eng-mean', e.learned_mean_pps + ' pkt/s'); setT('ai-eng-stddev', '±' + e.learned_stddev_pps + ' pkt/s');
+        setT('ai-eng-ceiling', e.adaptive_ceiling_pps + ' pkt/s'); setT('ai-eng-samples', e.total_samples + ' samples');
+        bar.style.width = Math.min(100, Math.round((e.total_samples / (e.warmup_target || 15)) * 100)) + '%';
+      } catch { /* card keeps its placeholder */ }
+    }
+    setTimeout(loadSettings, 0);
+    const eng = el('div', { class: 'panel pad' },
+      el('div', { class: 'head' }, el('h2', {}, 'Welford + EMA Activity-Based AI Engine'), el('span', { class: 'badge' }, '100% AUTONOMOUS • ZERO MANUAL THRESHOLDS')),
+      el('p', { class: 'muted small' }, "Automatically learns each device's normal network activity in real time using Welford's online variance algorithm and Exponential Moving Average. Threats are detected dynamically without static packet rules."),
+      el('div', { style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0' },
+        mv('ai-eng-status', 'Engine State'), mv('ai-eng-mean', 'Learned Normal Traffic'), mv('ai-eng-stddev', 'Activity Variance (EMA)'),
+        mv('ai-eng-ceiling', 'Dynamic Trigger Ceiling'), mv('ai-eng-samples', 'Heartbeats Analyzed'),
+        el('div', { class: 'stat' }, el('div', { class: 'muted small' }, 'Active Vectors'), el('b', { style: 'display:block' }, 'SYN • Port Scan • Auth • ARP • OT (502/102)'))),
+      el('div', { style: 'height:8px;border-radius:6px;background:rgba(255,255,255,.08);overflow:hidden;margin-bottom:12px' }, bar),
+      el('button', { class: 'btn', id: 'btn-recalibrate-ai', type: 'button', onclick: async () => {
+        try { const r = await api('POST', '/api/ai-engine/recalibrate', {}); toast(r.message); loadSettings(); } catch (x) { toast(x.message, true); }
+      } }, 'Recalibrate Activity Baseline'));
     current = { refresh: null, tick: null };
     return el('section', { class: 'view grid' },
+      eng,
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Detection & response')), f),
       el('div', { class: 'panel pad' }, el('div', { class: 'head' }, el('h2', {}, 'Account · ' + S.me.email)), pwForm));
   }
